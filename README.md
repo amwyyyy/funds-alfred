@@ -4,7 +4,7 @@
 
 灵感来源于 Chrome 插件 [`x2rr/funds`](https://github.com/x2rr/funds)（自选基金助手），数据源同样为东方财富（天天基金）公开 API，无需登录。
 
-![preview](./preview.png)
+![preview](./preview.jpg)
 
 ## 特性
 
