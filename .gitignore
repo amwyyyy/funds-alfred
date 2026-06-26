@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Build output
+funds-alfred.alfredworkflow
+
+# Test data
+/tmp/funds-test-data/
