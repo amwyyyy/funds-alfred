@@ -285,7 +285,9 @@ def item_for_fund(f: dict) -> dict:
     }
 
 
-def item_total(funds: list, when_text: str, group_label: str = "") -> dict:
+def item_total(
+    funds: list, when_text: str, group_label: str = "", uid: str = "fund-total"
+) -> dict:
     total_amount = sum((f["amount"] or 0) for f in funds)
     total_gains = sum((f["gains"] or 0) for f in funds)
     total_cost_gains = sum(
@@ -313,13 +315,106 @@ def item_total(funds: list, when_text: str, group_label: str = "") -> dict:
         f"今日 {fmt_signed(total_gains)} ({fmt_rate(rate)})"
     )
     return {
-        "uid": "fund-total",
+        "uid": uid,
         "title": title,
         "subtitle": subtitle,
         "arg": arg,
         "text": {"copy": arg, "largetype": arg},
         "valid": True,
     }
+
+
+def cmd_sum(groups: list) -> None:
+    """跨所有分组合计 (fund sum)。
+
+    展示:
+      - 顶部: 全部分组合计行
+      - 接着每个分组的合计行 (不展示单只基金明细)
+      - 空组用占位行标注
+    """
+    # 收集所有持仓; code 在 (group_idx, holding) 维度跨组可能重复
+    holdings_ctx = []  # list of (gi, code, holding)
+    unique_codes = []
+    seen = set()
+    for gi, g in enumerate(groups):
+        for h in g.get("funds") or []:
+            if not h.get("code"):
+                continue
+            code = str(h["code"]).zfill(6)
+            holdings_ctx.append((gi, code, h))
+            if code not in seen:
+                seen.add(code)
+                unique_codes.append(code)
+
+    if not holdings_ctx:
+        out = {
+            "items": [
+                item_error(
+                    "所有分组都没有基金",
+                    "运行 `fund config` 编辑配置, 给某个分组的 funds 添加 {code, num, cost?}",
+                )
+            ]
+        }
+        print(json.dumps(out, ensure_ascii=False))
+        return
+
+    # 并发拉一次, 全部分组共享
+    try:
+        results = fetch_funds(unique_codes)
+    except Exception as e:
+        out = {"items": [item_error("网络请求失败", str(e))]}
+        print(json.dumps(out, ensure_ascii=False))
+        return
+
+    # 按分组聚合 parse_fund 结果
+    group_parsed = [[] for _ in groups]
+    latest_gztime = None
+    any_settled = False
+    all_settled = True
+    for gi, code, h in holdings_ctx:
+        r = results.get(code)
+        if not r or (isinstance(r, dict) and r.get("__error__")):
+            all_settled = False  # 缺失基金视为未结算, 影响 prefix
+            continue
+        f = parse_fund(r, h)
+        group_parsed[gi].append(f)
+        gt = f.get("gztime")
+        if gt and (latest_gztime is None or gt > latest_gztime):
+            latest_gztime = gt
+        if f["settled"]:
+            any_settled = True
+        else:
+            all_settled = False
+
+    if latest_gztime:
+        prefix = "净值" if any_settled and all_settled else "估算"
+        when = f"{prefix} @ {latest_gztime}"
+    else:
+        when = datetime.now().strftime("更新 @ %H:%M")
+
+    items = []
+    # 顶部: 全部分组总合计
+    all_parsed = [f for fs in group_parsed for f in fs]
+    if all_parsed:
+        items.append(item_total(all_parsed, when, "全部分组", uid="sum-all"))
+
+    # 每个分组的合计行 (无明细基金)
+    for gi, g in enumerate(groups):
+        funds = group_parsed[gi]
+        configured = len(g.get("funds") or [])
+        if funds:
+            items.append(item_total(funds, when, g["name"], uid=f"sum-group-{gi}"))
+        else:
+            items.append(
+                {
+                    "uid": f"sum-group-{gi}",
+                    "title": f"➖ [{g['name']}] 无基金可估算",
+                    "subtitle": f"配置 {configured} 只, 0 只取到估值",
+                    "valid": False,
+                }
+            )
+
+    print(json.dumps({"items": items}, ensure_ascii=False))
 
 
 def item_open_config(reason: str = "") -> dict:
@@ -377,6 +472,11 @@ def main():
             ]
         }
         print(json.dumps(out, ensure_ascii=False))
+        return
+
+    # 子命令: `fund sum` 跨所有分组合计
+    if query in ("sum", "汇总", "总计", "合计", "all"):
+        cmd_sum(groups)
         return
 
     # 解析查询里的分组序号: query 第一个 token 若是数字 -> 切到对应组 (1-based)

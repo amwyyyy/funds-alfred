@@ -71,7 +71,7 @@ plist = {
                 "script": '"/usr/bin/python3" fund.py "$1"',
                 "scriptargtype": 1,  # pass {query} as argv
                 "scriptfile": "",
-                "subtext": "回车: 复制概要 · fund N: 切换到第 N 组 · fund config: 编辑",
+                "subtext": "回车: 复制概要 · fund N: 切组 · fund sum: 跨组合计 · fund config: 编辑",
                 "title": "自选基金",
                 "type": 0,  # /bin/bash
                 "withspace": True,
@@ -131,6 +131,7 @@ plist = {
         "## 用法\n\n"
         "- `fund`         查看自选基金 (默认第 1 组)\n"
         "- `fund N`       切换到第 N 个分组 (1-based)\n"
+        "- `fund sum`     跨所有分组合计 (只显示合计行, 不展示单只基金)\n"
         "- `fund config`  打开配置文件 funds.json 增删基金/分组\n\n"
         "首次运行会在 Alfred Workflow Data 目录下生成示例配置 (含分组示例)。\n"
     ),
