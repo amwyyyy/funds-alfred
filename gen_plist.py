@@ -71,7 +71,7 @@ plist = {
                 "script": '"/usr/bin/python3" fund.py "$1"',
                 "scriptargtype": 1,  # pass {query} as argv
                 "scriptfile": "",
-                "subtext": "回车: 复制概要 / 子命令 fund config 编辑基金列表",
+                "subtext": "回车: 复制概要 · fund N: 切换到第 N 组 · fund config: 编辑",
                 "title": "自选基金",
                 "type": 0,  # /bin/bash
                 "withspace": True,
@@ -129,9 +129,10 @@ plist = {
         "# Funds Alfred\n\n"
         "查看自选基金当前情况。数据源: 东方财富 (天天基金)。\n\n"
         "## 用法\n\n"
-        "- `fund`         查看自选基金列表\n"
-        "- `fund config`  打开配置文件 funds.json 增删基金\n\n"
-        "首次运行会在 Alfred Workflow Data 目录下生成示例配置。\n"
+        "- `fund`         查看自选基金 (默认第 1 组)\n"
+        "- `fund N`       切换到第 N 个分组 (1-based)\n"
+        "- `fund config`  打开配置文件 funds.json 增删基金/分组\n\n"
+        "首次运行会在 Alfred Workflow Data 目录下生成示例配置 (含分组示例)。\n"
     ),
     "uidata": {
         UID_SCRIPTFILTER: {"xpos": 30, "ypos": 110},

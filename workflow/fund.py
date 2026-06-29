@@ -50,11 +50,25 @@ def get_config_path() -> str:
 
 
 SAMPLE_CONFIG = {
-    "_doc": "code=基金代码(必填), num=持有份额(必填), cost=成本价(可选,有则显示持仓总收益)",
-    "funds": [
-        {"code": "161725", "num": 10000, "cost": 0.5162},
-        {"code": "001618", "num": 500},
-        {"code": "110022", "num": 200, "cost": 2.50},
+    "_doc": (
+        "groups=分组列表, 每组有 name 与 funds; "
+        "funds[*]: code=基金代码(必填), num=持有份额(必填), cost=成本价(可选,有则显示持仓总收益). "
+        "兼容旧版顶层 funds (会被当作单个默认分组)."
+    ),
+    "groups": [
+        {
+            "name": "核心持仓",
+            "funds": [
+                {"code": "161725", "num": 10000, "cost": 0.5162},
+                {"code": "110022", "num": 200, "cost": 2.50},
+            ],
+        },
+        {
+            "name": "卫星仓",
+            "funds": [
+                {"code": "001618", "num": 500},
+            ],
+        },
     ],
 }
 
@@ -68,6 +82,31 @@ def load_config() -> dict:
         return SAMPLE_CONFIG
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def normalize_groups(cfg: dict) -> list:
+    """将配置统一成 [{name, funds:[...]}, ...] 形式。
+
+    优先读取 cfg['groups']; 不存在但有顶层 cfg['funds'] 时
+    包装为单个名为 '默认' 的分组以保持向后兼容。
+    每个分组的 funds 字段缺失/非列表时按空列表处理。
+    """
+    groups = cfg.get("groups")
+    if isinstance(groups, list) and groups:
+        out = []
+        for i, g in enumerate(groups):
+            if not isinstance(g, dict):
+                continue
+            name = (g.get("name") or f"分组 {i + 1}").strip() or f"分组 {i + 1}"
+            funds = g.get("funds") if isinstance(g.get("funds"), list) else []
+            out.append({"name": name, "funds": funds})
+        if out:
+            return out
+    # 旧格式兼容
+    legacy = cfg.get("funds")
+    if isinstance(legacy, list):
+        return [{"name": "默认", "funds": legacy}]
+    return []
 
 
 # ---------- HTTP ----------
@@ -246,7 +285,7 @@ def item_for_fund(f: dict) -> dict:
     }
 
 
-def item_total(funds: list, when_text: str) -> dict:
+def item_total(funds: list, when_text: str, group_label: str = "") -> dict:
     total_amount = sum((f["amount"] or 0) for f in funds)
     total_gains = sum((f["gains"] or 0) for f in funds)
     total_cost_gains = sum(
@@ -258,8 +297,9 @@ def item_total(funds: list, when_text: str) -> dict:
     base = total_amount - total_gains
     rate = (total_gains * 100 / base) if base else None
 
+    label = f"[{group_label}] " if group_label else ""
     title = (
-        f"{rate_emoji(rate)} 合计 持有 {fmt_money(total_amount)}  ·  "
+        f"{rate_emoji(rate)} {label}持有 {fmt_money(total_amount)}  ·  "
         f"今日 {fmt_signed(total_gains)} ({fmt_rate(rate)})"
     )
     parts = [f"{len(funds)} 只基金"]
@@ -269,7 +309,7 @@ def item_total(funds: list, when_text: str) -> dict:
     subtitle = "  ·  ".join(parts)
 
     arg = (
-        f"合计 持有 {fmt_money(total_amount)}  "
+        f"{label}持有 {fmt_money(total_amount)}  "
         f"今日 {fmt_signed(total_gains)} ({fmt_rate(rate)})"
     )
     return {
@@ -328,15 +368,44 @@ def main():
         print(json.dumps(out, ensure_ascii=False))
         return
 
-    holdings = cfg.get("funds") or []
-    if not holdings:
+    groups = normalize_groups(cfg)
+    if not groups:
         out = {
             "items": [
-                item_error("尚未配置任何基金", "在配置文件中添加 {code, num, cost?} 后再试"),
+                item_error("尚未配置任何基金", "在配置文件中添加 groups 或 funds 后再试"),
                 item_open_config(),
             ]
         }
         print(json.dumps(out, ensure_ascii=False))
+        return
+
+    # 解析查询里的分组序号: query 第一个 token 若是数字 -> 切到对应组 (1-based)
+    selected_idx = 0  # 默认第 1 组
+    out_of_range_msg = ""
+    if query:
+        first = query.split()[0]
+        if first.isdigit():
+            n = int(first)
+            if 1 <= n <= len(groups):
+                selected_idx = n - 1
+            else:
+                out_of_range_msg = (
+                    f"分组序号 {n} 越界 (共 {len(groups)} 组), 已显示第 1 组"
+                )
+
+    cur_group = groups[selected_idx]
+    holdings = cur_group["funds"]
+    group_label = cur_group["name"]
+
+    if not holdings:
+        items = [
+            item_error(
+                f"分组「{cur_group['name']}」尚未配置任何基金",
+                "在配置文件中给该组的 funds 数组添加 {code, num, cost?}",
+            ),
+        ]
+        items.append(item_open_config())
+        print(json.dumps({"items": items}, ensure_ascii=False))
         return
 
     codes = [str(h.get("code")).zfill(6) for h in holdings if h.get("code")]
@@ -382,7 +451,11 @@ def main():
     else:
         when = datetime.now().strftime("更新 @ %H:%M")
 
-    items = [item_total(parsed, when)] if parsed else []
+    items = []
+    if out_of_range_msg:
+        items.append(item_error("分组序号越界", out_of_range_msg))
+    if parsed:
+        items.append(item_total(parsed, when, group_label))
     items.extend(item_for_fund(f) for f in parsed)
 
     for code in missing:

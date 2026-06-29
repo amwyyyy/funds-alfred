@@ -36,11 +36,12 @@ open funds-alfred.alfredworkflow
 
 | 关键词 | 行为 |
 |---|---|
-| `fund` | 查看自选基金列表 |
+| `fund` | 查看自选基金列表（默认第 1 个分组） |
+| `fund 2` | 切换到第 2 个分组（数字 = 分组序号，从 1 开始） |
 | `fund config` | 打开配置文件 `funds.json`（用默认文本编辑器） |
 
 在列表中：
-- **回车 ⏎**：把当前行的概要复制到剪贴板
+- **回车 ⏎**：在普通基金行/合计行上把概要复制到剪贴板
 - **⌘+L**：以 large type 大字号显示当前行
 
 ## 配置文件
@@ -51,7 +52,29 @@ open funds-alfred.alfredworkflow
 ~/Library/Application Support/Alfred/Workflow Data/com.denis.funds-alfred/funds.json
 ```
 
-格式：
+新格式（推荐，支持分组）：
+
+```json
+{
+  "groups": [
+    {
+      "name": "核心持仓",
+      "funds": [
+        { "code": "161725", "num": 10000, "cost": 0.5162 },
+        { "code": "110022", "num": 200, "cost": 2.50 }
+      ]
+    },
+    {
+      "name": "卫星仓",
+      "funds": [
+        { "code": "001618", "num": 500 }
+      ]
+    }
+  ]
+}
+```
+
+旧格式（兼容，会被当作单个名为「默认」的分组）：
 
 ```json
 {
@@ -67,6 +90,8 @@ open funds-alfred.alfredworkflow
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
+| `groups[*].name` | ✅ | 分组名（显示在合计行的标签里） |
+| `groups[*].funds` | ✅ | 该分组下的基金列表 |
 | `code` | ✅ | 6 位基金代码（字符串；如 `"001618"`，前导零不会丢） |
 | `num` | ✅ | 持有份额 |
 | `cost` | ❌ | 成本价；填写后才会显示「持仓总收益 / 持仓收益率」 |
