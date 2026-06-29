@@ -39,7 +39,7 @@ open funds-alfred.alfredworkflow
 |---|---|
 | `fund` | 查看自选基金列表（默认第 1 个分组） |
 | `fund 2` | 切换到第 2 个分组（数字 = 分组序号，从 1 开始） |
-| `fund config` | 打开配置文件 `funds.json`（用默认文本编辑器） |
+| `fund config` | 打开配置文件 `funds.json`（默认列表中不会展示编辑入口） |
 
 在列表中：
 - **回车 ⏎**：在普通基金行/合计行上把概要复制到剪贴板
@@ -102,7 +102,7 @@ open funds-alfred.alfredworkflow
 | 情况 | 行为 |
 |---|---|
 | `fund N` 序号越界 | 提示「分组序号 N 越界」，回落到第 1 组继续显示 |
-| 该组 `funds: []` 为空 | 提示「分组「xxx」尚未配置任何基金」，并提供「编辑 funds.json」入口 |
+| 该组 `funds: []` 为空 | 提示「分组「xxx」尚未配置任何基金」（运行 `fund config` 去补充） |
 | 同时存在 `groups` 与 `funds` | 优先使用 `groups`，顶层 `funds` 被忽略 |
 | 分组项缺 `name` | 自动命名为「分组 N」 |
 

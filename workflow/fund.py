@@ -401,10 +401,9 @@ def main():
         items = [
             item_error(
                 f"分组「{cur_group['name']}」尚未配置任何基金",
-                "在配置文件中给该组的 funds 数组添加 {code, num, cost?}",
+                "运行 `fund config` 编辑配置, 给该组的 funds 添加 {code, num, cost?}",
             ),
         ]
-        items.append(item_open_config())
         print(json.dumps({"items": items}, ensure_ascii=False))
         return
 
@@ -462,8 +461,6 @@ def main():
         items.append(item_error(f"{code} 未找到", "请检查基金代码是否正确"))
     for code, msg in errors:
         items.append(item_error(f"{code} 请求失败", msg))
-
-    items.append(item_open_config())
 
     out = {"items": items}
     print(json.dumps(out, ensure_ascii=False))
