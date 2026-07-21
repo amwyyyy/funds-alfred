@@ -174,27 +174,35 @@ open funds-alfred.alfredworkflow
 
 ## 数据接口
 
-只调用一个公开接口（天天基金老版实时估值端点）：
+调用天天基金 `FundValuationLast` 批量估值接口（主域失败自动回退备用域）：
 
 ```
-GET https://fundgz.1234567.com.cn/js/<基金代码>.js
+GET https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast
+GET https://fundcomapi.eastmoney.com/mm/newCore/FundValuationLast   # 备用
+    ?FCODES=<基金代码1>,<基金代码2>,...
+    &FIELDS=FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE
 ```
 
-返回示例（JSONP 包装）：
+返回示例（纯 JSON，非 JSONP）：
 
-```js
-jsonpgz({"fundcode":"161725","name":"招商中证白酒指数(LOF)A",
-        "jzrq":"2026-06-25","dwjz":"0.5162",
-        "gsz":"0.5077","gszzl":"-1.65","gztime":"2026-06-26 11:21"});
+```json
+{"data":[
+  {"FCODE":"161725","SHORTNAME":"招商中证白酒指数(LOF)A",
+   "PDATE":"2026-07-20","NAV":0.5582,
+   "GSZ":0.5478,"GSZZL":-1.86,"GZTIME":"2026-07-21 14:26"},
+  {"FCODE":"000001","SHORTNAME":"华夏成长混合",
+   "PDATE":"2026-07-20","NAV":1.306,
+   "GSZ":null,"GSZZL":null,"GZTIME":null}
+]}
 ```
 
-- 无需 Cookie、Token 或任何鉴权（CORS `*`）
-- 不存在的基金代码会返回 `jsonpgz();`（空参数），脚本识别为「未找到」
-- 多只基金通过 `ThreadPoolExecutor` 并发拉取，3 只 ≈ 0.2 秒
+- 无需 Cookie / Token / 鉴权
+- 单次请求批量拉取整个分组（`FCODES` 逗号分隔），比逐只并发更快
+- 字段映射：`FCODE→fundcode`、`SHORTNAME→name`、`GSZ→gsz`、`GSZZL→gszzl`、`GZTIME→gztime`、`NAV→dwjz`、`PDATE→jzrq`
+- 不存在的基金代码不会出现在 `data` 中，脚本识别为「未找到」
+- **部分主动管理型基金** `GSZ/GSZZL/GZTIME` 为 `null`（数据侧不再提供盘中估值），脚本保留名称与正式净值，标注「无盘中估值」，今日估算显示 `-`
 
-> 注：原 Chrome 插件 `x2rr/funds` v2.0+ 改用了 `fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo`
-> 批量端点，但实测该端点在交易时段也会对非官方 App 客户端返回 `GSZ: null`
-> （估值字段缺失），所以本 workflow 退回使用更稳定的老端点。
+> 历史：2026-07-21 前使用老版 JSONP 端点 `fundgz.1234567.com.cn/js/<code>.js`，该端点当日 301 下线（跳转 notfound 页），故切换至上述接口。
 
 ## 计算逻辑
 
@@ -202,7 +210,7 @@ jsonpgz({"fundcode":"161725","name":"招商中证白酒指数(LOF)A",
 
 | 指标 | 公式 |
 |---|---|
-| 持有额 | `gsz × num`（实时；闭市退化为 `dwjz × num`） |
+| 持有额 | `gsz × num`（实时；闭市或无盘中估值时退化为 `dwjz × num`） |
 | 涨跌幅 | `gszzl`（已结算 ✓ 时即为当日真实涨跌幅） |
 | 今日估算收益 | `(gsz − dwjz) × num` |
 | 持仓总收益 | `(gsz − cost) × num`（仅当 `cost` 存在时；闭市退化为 dwjz） |
@@ -211,7 +219,9 @@ jsonpgz({"fundcode":"161725","name":"招商中证白酒指数(LOF)A",
 ## 常见问题
 
 **Q: 闭市时所有「今日估算」都显示 —？**
-A: 不会。本 workflow 使用 `fundgz.1234567.com.cn` 端点，**即便在闭市期间也会返回当日最后一次的估算值**（`gsz`/`gszzl`/`gztime`），所以全天任意时段都能看到当天的估值。只有在极少数情况（如开盘前的凌晨、或基金当天暂停估值）才会返回空。
+A: 分情况。本 workflow 调用的 `FundValuationLast` 接口对**有盘中估值的基金**（大多数指数型 / ETF 联接），即便闭市也返回当日最后一次估值（`gsz`/`gszzl`/`gztime`），全天可见；但对**部分主动管理型基金**，数据侧已不再提供盘中估值（`GSZ=null`），这类基金会标注「无盘中估值」，今日估算显示 `-`，仍保留名称与正式净值。开盘前凌晨或基金当天暂停估值时同样显示 `-`。
+
+> 2026-07-21 前使用的 `fundgz.1234567.com.cn` 端点几乎对所有基金都返回估值；切换到新接口后主动管理型基金不再有盘中估值，这是数据源差异，并非 bug。
 
 **Q: 基金代码以 0 开头怎么办？**
 A: JSON 中**必须用字符串**，例如 `"code": "001618"`，否则 JSON 解析后会变成数字 `1618` 导致请求失败。脚本会自动补零到 6 位，但仍建议你直接写成字符串。

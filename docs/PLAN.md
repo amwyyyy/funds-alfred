@@ -88,6 +88,8 @@ jsonpgz({"fundcode":"161725","name":"招商中证白酒指数(LOF)A",
         "gsz":"0.5077","gszzl":"-1.65","gztime":"2026-06-26 11:21"});
 ```
 
+> 📌 **2026-07-21 更新**：上述 `fundgz` JSONP 端点当日 301 下线（跳转 `fund.eastmoney.com/notfound.html`），导致全部基金「暂无数据」。已切换至天天基金 H5 `FundComApi.getValuationLast` 对应接口 `fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast`（备用域 `fundcomapi.eastmoney.com`），单次 `FCODES` 批量请求替代 `ThreadPoolExecutor` 并发。新接口对部分主动管理型基金返回 `GSZ=null`（不再提供盘中估值），对此类基金保留名称与正式净值并标注「无盘中估值」。详见 `workflow/fund.py`。
+
 字段映射：
 - `dwjz` → 单位净值（昨日结算）
 - `gsz` / `gszzl` → 估算净值 / 估算涨跌幅

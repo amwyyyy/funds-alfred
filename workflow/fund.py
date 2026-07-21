@@ -2,34 +2,38 @@
 # -*- coding: utf-8 -*-
 """
 Alfred Script Filter: 查看自选基金当前情况
-数据源: 天天基金实时估算端点 fundgz.1234567.com.cn (与原 x2rr/funds v1.x 一致)
+数据源: 天天基金 FundValuationLast 批量估值接口
+  主域: https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast
+  备用: https://fundcomapi.eastmoney.com/mm/newCore/FundValuationLast
 
-为什么不用 fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?
-  实测该端点在交易时段也会返回 GSZ=null (拒绝给非 App 客户端实时估值)。
-  反而 fundgz 老端点公开、稳定、无鉴权、CORS *, 一直能拿到实时估值。
+2026-07-21 起 fundgz.1234567.com.cn JSONP 端点 301 下线, 改用天天基金 H5
+FundComApi.getValuationLast 对应接口, 支持 FCODES 批量请求。
+部分主动管理型基金 GSZ/GSZZL/GZTIME 为 null (数据侧不再提供盘中估值),
+保留名称与正式净值并标注"无盘中估值"。
 """
 
 import json
 import os
-import re
 import ssl
 import sys
+import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # ---------- 常量 ----------
-API_TPL = "https://fundgz.1234567.com.cn/js/{code}.js"
+# 估值接口: 天天基金 FundValuationLast (批量, 主域失败回退备用域)
+API_HOSTS = (
+    "https://fundcomapi.tiantianfunds.com",
+    "https://fundcomapi.eastmoney.com",
+)
+API_PATH = "/mm/newCore/FundValuationLast"
+API_FIELDS = "FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE"
 TIMEOUT = 6  # seconds per request
-CONCURRENCY = 8  # 最多并发数
 
 # 中式红涨绿跌
 EMOJI_UP = "📈"
 EMOJI_DOWN = "📉"
 EMOJI_FLAT = "➖"
-
-# 匹配 jsonpgz({...}) 包装
-JSONP_RE = re.compile(r"^\s*jsonpgz\((.*)\)\s*;?\s*$", re.S)
 
 
 # ---------- 配置文件 ----------
@@ -113,41 +117,52 @@ def normalize_groups(cfg: dict) -> list:
 _SSL_CTX = ssl.create_default_context()
 
 
-def fetch_one(code):
-    """调用 fundgz 拉单只基金。返回解析后的字典，未找到返回 None。"""
-    url = API_TPL.format(code=code)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
-            "Accept": "*/*",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
-    m = JSONP_RE.match(body)
-    if not m:
-        return None
-    inner = m.group(1).strip()
-    if not inner:  # jsonpgz(); 表示基金不存在
-        return None
-    return json.loads(inner)
+def _normalize_row(row: dict) -> dict:
+    """把 FundValuationLast 字段名归一化为旧 fundgz 字段名, 复用下游 parse_fund。"""
+    return {
+        "fundcode": row.get("FCODE"),
+        "name": row.get("SHORTNAME"),
+        "dwjz": row.get("NAV"),
+        "jzrq": row.get("PDATE"),
+        "gsz": row.get("GSZ"),
+        "gszzl": row.get("GSZZL"),
+        "gztime": row.get("GZTIME"),
+    }
 
 
 def fetch_funds(codes):
-    """并发拉取多只基金。返回 {code: parsed_dict_or_None}。"""
-    out = {}
+    """批量拉取基金估值。返回 {code: normalized_row_or_None}。
+
+    单次请求拿回全部 codes; 不存在的 code 不会出现在响应 data 中 -> None (missing)。
+    主域失败自动回退备用域; 全部失败抛异常。
+    """
+    out = {c: None for c in codes}
     if not codes:
         return out
-    with ThreadPoolExecutor(max_workers=min(CONCURRENCY, len(codes))) as ex:
-        future_map = {ex.submit(fetch_one, c): c for c in codes}
-        for fut in as_completed(future_map):
-            code = future_map[fut]
-            try:
-                out[code] = fut.result()
-            except Exception as e:
-                out[code] = {"__error__": str(e)}
-    return out
+    qs = urllib.parse.urlencode({"FCODES": ",".join(codes), "FIELDS": API_FIELDS})
+    last_err = None
+    for host in API_HOSTS:
+        url = f"{host}{API_PATH}?{qs}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
+                "Accept": "*/*",
+                "Referer": "https://fund.eastmoney.com/",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as e:
+            last_err = e
+            continue
+        for row in payload.get("data") or []:
+            c = row.get("FCODE")
+            if c:
+                out[c] = _normalize_row(row)
+        return out
+    raise last_err or RuntimeError("估值接口均不可用")
 
 
 # ---------- 计算 ----------
@@ -161,11 +176,11 @@ def to_float(x, default=None):
 
 
 def parse_fund(api_row: dict, holding: dict) -> dict:
-    """将 fundgz 返回 + 用户持仓信息合成一行展示用数据。
+    """将估值接口返回 (经 _normalize_row 归一化) + 用户持仓信息合成一行展示用数据。
 
-    fundgz 返回字段:
-      fundcode, name, jzrq (净值日期), dwjz (单位净值),
+    归一化字段: fundcode, name, jzrq (净值日期), dwjz (单位净值),
       gsz (估算净值), gszzl (估算涨跌幅%), gztime (估算时间 'YYYY-mm-dd HH:MM')
+    gsz/gszzl/gztime 可能为 None (主动管理型基金无盘中估值)。
     """
     code = api_row.get("fundcode")
     name = api_row.get("name", code)
@@ -251,7 +266,12 @@ def rate_emoji(rate):
 
 # ---------- 渲染 Alfred Items ----------
 def item_for_fund(f: dict) -> dict:
-    flag = " ✓" if f["settled"] else (" [估算]" if f["rate"] is not None else "")
+    if f["settled"]:
+        flag = " ✓"
+    elif f["rate"] is not None:
+        flag = " [估算]"
+    else:
+        flag = " [无盘中估值]"
     title = f"{rate_emoji(f['rate'])} {f['name']} · {fmt_rate(f['rate'])}{flag}"
 
     parts = [f"持有 {fmt_money(f['amount'])}"]
@@ -373,7 +393,7 @@ def cmd_sum(groups: list) -> None:
     all_settled = True
     for gi, code, h in holdings_ctx:
         r = results.get(code)
-        if not r or (isinstance(r, dict) and r.get("__error__")):
+        if not r:
             all_settled = False  # 缺失基金视为未结算, 影响 prefix
             continue
         f = parse_fund(r, h)
@@ -523,14 +543,10 @@ def main():
     # 3. 整理 + 排序: 涨跌幅降序 (涨得多的在前)
     parsed = []
     missing = []
-    errors = []  # [(code, msg)]
     for code in codes:
         r = results.get(code)
-        if r is None:
+        if not r:
             missing.append(code)
-            continue
-        if isinstance(r, dict) and r.get("__error__"):
-            errors.append((code, r["__error__"]))
             continue
         parsed.append(parse_fund(r, holdings_by_code[code]))
     parsed.sort(key=lambda f: (f["rate"] if f["rate"] is not None else -999), reverse=True)
@@ -559,8 +575,6 @@ def main():
 
     for code in missing:
         items.append(item_error(f"{code} 未找到", "请检查基金代码是否正确"))
-    for code, msg in errors:
-        items.append(item_error(f"{code} 请求失败", msg))
 
     out = {"items": items}
     print(json.dumps(out, ensure_ascii=False))
