@@ -6,6 +6,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "workflow"))
 import fund
 
 
+class CurlGetTest(unittest.TestCase):
+    def test_failure_returns_empty(self):
+        # 不可达地址 -> 返回 "" (不抛异常)
+        self.assertEqual(fund._curl_get_text("http://127.0.0.1:1/x", timeout=2), "")
+
+
 class ParseHoldingsTest(unittest.TestCase):
     SAMPLE = (
         "<table><tbody>"

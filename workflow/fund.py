@@ -17,11 +17,10 @@ import json
 import os
 import re
 import html
-import ssl
+import subprocess
 import sys
 import time
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
@@ -123,7 +122,22 @@ def normalize_groups(cfg: dict) -> list:
 
 
 # ---------- HTTP ----------
-_SSL_CTX = ssl.create_default_context()
+def _curl_get_text(url: str, headers: Optional[dict] = None, timeout: int = TIMEOUT) -> str:
+    """用 curl 子进程发起 GET, 返回响应文本, 失败返 ''。
+
+    天天基金 push2 行情服务器对 Python urllib 的 TLS 指纹反爬 (直接 RST 连接,
+    urllib 全部 RemoteDisconnected), 而 curl 的 TLS 指纹可通过。curl 为 macOS
+    自带, 不破坏零依赖。fundmobapi/fundf10 当前 urllib 仍可用, 但统一走 curl
+    更稳, 避免后续反爬升级再次"突然全 0"。
+    """
+    cmd = ["curl", "-sS", "-m", str(timeout), "--compressed", url]
+    for k, v in (headers or {}).items():
+        cmd += ["-H", f"{k}: {v}"]
+    try:
+        cp = subprocess.run(cmd, capture_output=True, timeout=timeout + 3)
+        return cp.stdout.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 
 def _normalize_row(row: dict) -> dict:
@@ -162,16 +176,12 @@ def fetch_funds(codes):
         "deviceid": DEVICE_ID,
         "Fcodes": ",".join(codes),
     })
-    req = urllib.request.Request(
-        f"{API_URL}?{qs}",
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
-            "Accept": "*/*",
-            "Referer": "https://fund.eastmoney.com/",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
-        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
+        "Accept": "*/*",
+        "Referer": "https://fund.eastmoney.com/",
+    }
+    payload = json.loads(_curl_get_text(f"{API_URL}?{qs}", req_headers) or "{}")
     expansion = payload.get("Expansion") or {}
     expansion_gztime = expansion.get("GZTIME")
     for row in payload.get("Datas") or []:
@@ -259,18 +269,13 @@ def _fetch_holdings_remote(code: str):
             "year": str(year),
             "month": str(month),
         })
-        req = urllib.request.Request(
+        raw = _curl_get_text(
             f"{HOLDINGS_API}?{qs}",
-            headers={
+            {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
                 "Referer": "https://fundf10.eastmoney.com/",
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except Exception:
-            continue
         stocks = _parse_holdings_html(raw)
         if stocks:
             return stocks
@@ -306,14 +311,9 @@ def fetch_stock_quotes(secids):
         "fields": "f12,f14,f2,f3",
         "_": str(int(time.time())),
     })
-    req = urllib.request.Request(
-        f"{STOCK_QUOTE_API}?{qs}",
-        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
+        payload = json.loads(_curl_get_text(f"{STOCK_QUOTE_API}?{qs}", {"User-Agent": "Mozilla/5.0"}) or "{}")
+    except (ValueError, TypeError):
         return {}
     out = {}
     for d in ((payload.get("data") or {}).get("diff")) or []:
@@ -375,6 +375,9 @@ def build_estimates(codes, results):
     )
     quotes = fetch_stock_quotes(secids)
     out = {}
+    # 行情接口整体故障(quotes 空)时, 不产生假的 0% 估算, 全部降级为无估值
+    if not quotes:
+        return {code: None for code in codes}
     for code in codes:
         nav = to_float((results.get(code) or {}).get("dwjz"))
         # 优先: 重仓股加权估算 (指数/行业基金)
@@ -427,13 +430,11 @@ def fetch_fund_detail(code: str):
         "product": "EFund",
         "Version": "1",
     })
-    req = urllib.request.Request(
-        f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNDetailInformation?{qs}",
-        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        payload = json.loads(_curl_get_text(
+            f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNDetailInformation?{qs}",
+            {"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"},
+        ) or "{}")
         datas = payload.get("Datas") or {}
         idx = datas.get("INDEXCODE") or None
     except Exception:
