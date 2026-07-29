@@ -68,6 +68,32 @@ class EstimateTest(unittest.TestCase):
         self.assertIsNotNone(est)  # 不因缺失而整体失败
 
 
+class IndexSecidTest(unittest.TestCase):
+    def test_sh_index(self):
+        # 000688 科创50 -> 沪市 1.
+        self.assertEqual(fund._index_secid("000688"), "1.000688")
+
+    def test_sz_index(self):
+        # 399997 中证白酒 -> 深市 0.
+        self.assertEqual(fund._index_secid("399997"), "0.399997")
+
+
+class IndexEstimateTest(unittest.TestCase):
+    def test_index_estimate(self):
+        # 跟踪指数 000688 当日 -0.87%, nav=1.3065
+        quotes = {"000688": -0.87}
+        est = fund.estimate_gsz_by_index(1.3065, "000688", quotes)
+        self.assertIsNotNone(est)
+        self.assertAlmostEqual(est["rate"], -0.87, places=2)
+        self.assertAlmostEqual(est["gsz"], 1.3065 * (1 - 0.87 / 100), places=4)
+
+    def test_index_missing_quote_returns_none(self):
+        self.assertIsNone(fund.estimate_gsz_by_index(1.0, "000688", {}))
+
+    def test_index_no_nav_returns_none(self):
+        self.assertIsNone(fund.estimate_gsz_by_index(None, "000688", {"000688": 1.0}))
+
+
 class ParseFundEstimateTest(unittest.TestCase):
     def _row(self, gsz=None, gszzl=None, nav="1.0000", pdate="2026-07-28", navchgrt="1.50", gztime=None):
         return {"fundcode": "240011", "name": "X", "dwjz": nav, "jzrq": pdate,

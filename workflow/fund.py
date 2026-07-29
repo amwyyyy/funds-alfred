@@ -364,13 +364,86 @@ def build_estimates(codes, results):
     with ThreadPoolExecutor(max_workers=8) as ex:
         for code, hs in zip(codes, ex.map(fetch_holdings, codes)):
             holdings_by_code[code] = hs
-    secids = sorted({h["secid"] for hs in holdings_by_code.values() for h in hs})
+    # 跟踪指数 (用于联接/指数基金: 重仓覆盖不足时回退)
+    detail_by_code = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for code, idx in zip(codes, ex.map(fetch_fund_detail, codes)):
+            detail_by_code[code] = idx
+    secids = sorted(
+        {h["secid"] for hs in holdings_by_code.values() for h in hs}
+        | {_index_secid(idx) for idx in detail_by_code.values() if idx}
+    )
     quotes = fetch_stock_quotes(secids)
     out = {}
     for code in codes:
         nav = to_float((results.get(code) or {}).get("dwjz"))
-        out[code] = estimate_gsz(nav, holdings_by_code.get(code, []), quotes)
+        # 优先: 重仓股加权估算 (指数/行业基金)
+        est = estimate_gsz(nav, holdings_by_code.get(code, []), quotes)
+        # 回退: 跟踪指数估算 (ETF联接/指数基金, 重仓覆盖不足)
+        if est is None:
+            idx = detail_by_code.get(code)
+            if idx:
+                est = estimate_gsz_by_index(nav, idx, quotes)
+        out[code] = est
     return out
+
+
+def _index_secid(index_code: str) -> str:
+    """指数代码 -> push2 secid。399xxx 深市(0.), 其余沪市(1.)。"""
+    if not index_code:
+        return ""
+    market = "0" if index_code.startswith("399") else "1"
+    return f"{market}.{index_code}"
+
+
+def estimate_gsz_by_index(nav, index_code, quotes):
+    """用跟踪指数当日涨跌估算净值 (联接/指数基金)。
+    返回 {"gsz", "rate", "cov"} 或 None。cov=100 (指数全覆盖)。"""
+    if nav is None or not index_code:
+        return None
+    rate = quotes.get(index_code)
+    if rate is None:
+        return None
+    return {
+        "gsz": nav * (1 + rate / 100.0),
+        "rate": rate,
+        "cov": 100.0,
+    }
+
+
+def fetch_fund_detail(code: str):
+    """取基金跟踪指数代码 (FundMNDetailInformation.INDEXCODE), 带缓存。
+    非指数基金/失败返 None。缓存并入 holdings_cache (跟踪标的基本不变)。"""
+    cache = load_holdings_cache()
+    entry = cache.get(code) or {}
+    idx = entry.get("indexcode")
+    if idx and _cache_fresh(entry):
+        return idx
+    qs = urllib.parse.urlencode({
+        "FCODE": code,
+        "deviceid": DEVICE_ID,
+        "plat": "Android",
+        "appType": "ttjj",
+        "product": "EFund",
+        "Version": "1",
+    })
+    req = urllib.request.Request(
+        f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNDetailInformation?{qs}",
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        datas = payload.get("Datas") or {}
+        idx = datas.get("INDEXCODE") or None
+    except Exception:
+        idx = None
+    if idx:
+        cache[code] = {**entry, "indexcode": idx, "fetched_at": datetime.now().timestamp()}
+        save_holdings_cache(cache)
+    elif entry.get("indexcode"):
+        return entry["indexcode"]  # 远程失败回退旧缓存
+    return idx
 
 
 # ---------- 计算 ----------
