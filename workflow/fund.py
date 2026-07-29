@@ -355,6 +355,24 @@ def estimate_gsz(nav, holdings, quotes, scale_to_full=SCALE_TO_FULL, min_coverag
     }
 
 
+def build_estimates(codes, results):
+    """对给定 codes 拉持仓+股票行情, 返回 {code: estimate_dict_or_None}。
+    缓存命中时 holdings 零请求; 股票行情一次批量。供 main / cmd_sum 共用。"""
+    if not codes:
+        return {}
+    holdings_by_code = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for code, hs in zip(codes, ex.map(fetch_holdings, codes)):
+            holdings_by_code[code] = hs
+    secids = sorted({h["secid"] for hs in holdings_by_code.values() for h in hs})
+    quotes = fetch_stock_quotes(secids)
+    out = {}
+    for code in codes:
+        nav = to_float((results.get(code) or {}).get("dwjz"))
+        out[code] = estimate_gsz(nav, holdings_by_code.get(code, []), quotes)
+    return out
+
+
 # ---------- 计算 ----------
 def to_float(x, default=None):
     if x is None or x == "" or x == "--":
@@ -627,25 +645,41 @@ def cmd_sum(groups: list) -> None:
         print(json.dumps(out, ensure_ascii=False))
         return
 
+    # 持仓自算估值 (盘中未结算时替代已下线的接口 GSZ)
+    estimates = build_estimates(unique_codes, results)
+
     # 按分组聚合 parse_fund 结果
     group_parsed = [[] for _ in groups]
     latest_gztime = None
-    has_realtime = False  # 是否有盘中实时估算 (决定合计行标「估算」还是「净值」)
+    has_self = False   # 是否有持仓自算 (决定合计行标「自算」)
+    has_api = False    # 是否有接口盘中估算 (兜底)
     for gi, code, h in holdings_ctx:
         r = results.get(code)
         if not r:
             continue
-        f = parse_fund(r, h, expansion_gztime)
+        f = parse_fund(r, h, expansion_gztime, estimate=estimates.get(code))
         group_parsed[gi].append(f)
         gt = f.get("gztime") or f.get("pdate")
         if gt and (latest_gztime is None or gt > latest_gztime):
             latest_gztime = gt
-        if not f["settled"] and f["gsz"] is not None:
-            has_realtime = True
+        if not f["settled"]:
+            if f.get("est_source") == "holdings":
+                has_self = True
+            elif f.get("est_source") == "api":
+                has_api = True
 
     if latest_gztime:
-        prefix = "估算" if has_realtime else "净值"
-        when = f"{prefix} @ {latest_gztime}"
+        if has_self:
+            # 自算基于今日盘中实时行情, 时间用当前; latest_gztime 仅是净值基准日(昨日)
+            prefix = "自算"
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        elif has_api:
+            prefix = "估算"
+            ts = latest_gztime
+        else:
+            prefix = "净值"
+            ts = latest_gztime
+        when = f"{prefix} @ {ts}"
     else:
         when = datetime.now().strftime("更新 @ %H:%M")
 
@@ -704,6 +738,24 @@ def main():
     # 子命令: `fund config` 直接打开配置
     if query in ("config", "conf", "edit", "设置", "配置"):
         out = {"items": [item_open_config("打开配置文件以增删基金")]}
+        print(json.dumps(out, ensure_ascii=False))
+        return
+
+    # 子命令: `fund refresh` 清空持仓缓存, 下次查询重新拉取重仓股
+    if query in ("refresh", "刷新", "更新持仓", "清缓存"):
+        path = get_holdings_cache_path()
+        removed = os.path.exists(path)
+        if removed:
+            os.remove(path)
+        out = {
+            "items": [{
+                "uid": "fund-refresh",
+                "title": "♻️ 持仓缓存已清空" if removed else "♻️ 无缓存可清",
+                "subtitle": "下次查询会重新拉取重仓股持仓（季报数据）",
+                "arg": "",
+                "valid": True,
+            }]
+        }
         print(json.dumps(out, ensure_ascii=False))
         return
 
@@ -777,6 +829,9 @@ def main():
         print(json.dumps(out, ensure_ascii=False))
         return
 
+    # 持仓自算估值 (盘中未结算时替代已下线的接口 GSZ)
+    estimates = build_estimates(codes, results)
+
     # 3. 整理 + 排序: 涨跌幅降序 (涨得多的在前)
     parsed = []
     missing = []
@@ -785,7 +840,7 @@ def main():
         if not r:
             missing.append(code)
             continue
-        parsed.append(parse_fund(r, holdings_by_code[code], expansion_gztime))
+        parsed.append(parse_fund(r, holdings_by_code[code], expansion_gztime, estimate=estimates.get(code)))
     parsed.sort(key=lambda f: (f["rate"] if f["rate"] is not None else -999), reverse=True)
 
     # 4. 拼参考时间 (用最新的 gztime)
@@ -796,10 +851,19 @@ def main():
         if gt and (latest_gztime is None or gt > latest_gztime):
             latest_gztime = gt
     if latest_gztime:
-        # 有盘中实时估算才标「估算」, 否则 (已结算 / 无盘中估值) 都是「净值」
-        has_realtime = any((not f["settled"] and f["gsz"] is not None) for f in parsed)
-        prefix = "估算" if has_realtime else "净值"
-        when = f"{prefix} @ {latest_gztime}"
+        has_self = any((not f["settled"] and f.get("est_source") == "holdings") for f in parsed)
+        has_api = any((not f["settled"] and f.get("est_source") == "api") for f in parsed)
+        if has_self:
+            # 自算基于今日盘中实时行情, 时间用当前; latest_gztime 仅是净值基准日(昨日)
+            prefix = "自算"
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        elif has_api:
+            prefix = "估算"
+            ts = latest_gztime
+        else:
+            prefix = "净值"
+            ts = latest_gztime
+        when = f"{prefix} @ {ts}"
     else:
         when = datetime.now().strftime("更新 @ %H:%M")
 
