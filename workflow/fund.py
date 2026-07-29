@@ -296,6 +296,65 @@ def fetch_holdings(code: str):
     return []
 
 
+def fetch_stock_quotes(secids):
+    """批量拉取股票当日涨跌幅。返回 {裸代码: 涨跌幅%}。失败返 {}。"""
+    if not secids:
+        return {}
+    qs = urllib.parse.urlencode({
+        "fltt": "2",
+        "secids": ",".join(secids),
+        "fields": "f12,f14,f2,f3",
+        "_": str(int(time.time())),
+    })
+    req = urllib.request.Request(
+        f"{STOCK_QUOTE_API}?{qs}",
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+    out = {}
+    for d in ((payload.get("data") or {}).get("diff")) or []:
+        code = d.get("f12")
+        if code:
+            out[code] = to_float(d.get("f3"), default=0.0)
+    return out
+
+
+def estimate_gsz(nav, holdings, quotes, scale_to_full=SCALE_TO_FULL, min_coverage=MIN_COVERAGE):
+    """基于前十大重仓股 + 实时行情估算净值。
+
+    holdings: [{secid('1.600519'), name, weight(%)}, ...]
+    quotes: {裸代码: 涨跌幅%}
+    返回 {"gsz": 估算净值, "rate": 估算涨幅%, "cov": 覆盖率%} 或 None。
+    口径B(scale_to_full=True): est% = Σ(wᵢ×rᵢ)/cov  放大到满仓
+    口径A(scale_to_full=False): est% = Σ(wᵢ×rᵢ)/100  其余按0
+    """
+    if not holdings or nav is None:
+        return None
+    cov = sum(h["weight"] for h in holdings)
+    if cov < min_coverage:
+        return None
+    contrib = 0.0
+    for h in holdings:
+        code = h["secid"].split(".")[-1]
+        r = quotes.get(code)
+        contrib += h["weight"] * (r if r is not None else 0.0)
+    if scale_to_full:
+        if cov <= 0:
+            return None
+        est = contrib / cov
+    else:
+        est = contrib / 100.0
+    return {
+        "gsz": nav * (1 + est / 100.0),
+        "rate": est,
+        "cov": cov,
+    }
+
+
 # ---------- 计算 ----------
 def to_float(x, default=None):
     if x is None or x == "" or x == "--":
