@@ -10,3 +10,6 @@ funds-alfred.alfredworkflow
 
 # Test data
 /tmp/funds-test-data/
+
+# JetBrains IDE
+.idea/

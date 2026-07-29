@@ -90,6 +90,10 @@ jsonpgz({"fundcode":"161725","name":"招商中证白酒指数(LOF)A",
 
 > 📌 **2026-07-21 更新**：上述 `fundgz` JSONP 端点当日 301 下线（跳转 `fund.eastmoney.com/notfound.html`），导致全部基金「暂无数据」。已切换至天天基金 H5 `FundComApi.getValuationLast` 对应接口 `fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast`（备用域 `fundcomapi.eastmoney.com`），单次 `FCODES` 批量请求替代 `ThreadPoolExecutor` 并发。新接口对部分主动管理型基金返回 `GSZ=null`（不再提供盘中估值），对此类基金保留名称与正式净值并标注「无盘中估值」。详见 `workflow/fund.py`。
 
+> 📌 **2026-07-22 二次调整**：`FundValuationLast` 实测有两个问题——结算后仍返回残留的盘中估算（不准），且对主动管理型基金 `GSZZL` 也为 null 只能显示 `-`。参考 choose-funds（LiuRabt）扩展改用 `fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo`（`plat=Android&appType=ttjj&product=EFund&Version=1`，`Fcodes` 批量），引入 `NAVCHGRT`（净值涨跌幅）字段兜底：`GSZ` 缺失即视为已结算，涨跌幅与收益改用 `NAVCHGRT`（收益公式 `(dwjz − dwjz/(1+NAVCHGRT/100)) × num`）；`GSZ` 有值时仍走盘中估算。
+
+> 📌 **2026-07-29 三次调整**：`FundMNFInfo` 对多数基金也不再返回 `GSZ`（盘中实时估值彻底无接口来源）。新增「持仓自算估值」：盘中未结算时，用基金最新季报前十大重仓股 + 占净值比 + 重仓股实时行情加权估算净值（口径 B：按重仓覆盖率缩放到满仓），标注 `[自算]`。重仓覆盖率不足时（如 ETF 联接基金仅 0.3%）回退用 `FundMNDetailInformation.INDEXCODE` 跟踪指数实时涨跌估算。持仓缓存 7 天，`fund refresh` 强制刷新。降级链：持仓自算 -> 跟踪指数自算 -> 接口 GSZ -> `NAVCHGRT` -> `[无估值]`。详见 `docs/superpowers/specs/2026-07-29-holdings-based-fund-valuation-design.md`。
+
 字段映射：
 - `dwjz` → 单位净值（昨日结算）
 - `gsz` / `gszzl` → 估算净值 / 估算涨跌幅
