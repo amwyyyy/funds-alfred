@@ -228,8 +228,10 @@ GET https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo
 
 - 季报有披露滞后，按当前月份倒推最近 4 个季度，取首个非空者。
 - 持仓缓存到 `${alfred_workflow_data}/holdings_cache.json`，有效期 7 天；`fund refresh` 强制清缓存重拉。
-- 兜底降级链：持仓自算 → 接口 GSZ（若有）→ 已结算 `NAVCHGRT` → `[无估值]`。
+- 兜底降级链：持仓自算 → 跟踪指数自算 → 接口 GSZ（若有）→ 已结算 `NAVCHGRT` → `[无估值]`。
 - 前十大覆盖率低于 `MIN_COVERAGE`(默认 20%) 视为不可信，降级。
+
+**跟踪指数回退**（ETF 联接 / 指数基金）：联接基金 95%+ 仓位是 ETF 份额，重仓股覆盖率极低（如 011608 仅 0.3%）。对此类基金，从 `FundMNDetailInformation.INDEXCODE` 取跟踪指数代码，用指数实时涨跌估算（指数含全成份股，比重仓十只更准）。指数代码市场前缀：`399xxx` 深市、其余沪市。
 
 ## 计算逻辑
 
