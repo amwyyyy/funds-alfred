@@ -365,16 +365,18 @@ def to_float(x, default=None):
         return default
 
 
-def parse_fund(api_row: dict, holding: dict, expansion_gztime: Optional[str] = None) -> dict:
+def parse_fund(api_row: dict, holding: dict, expansion_gztime: Optional[str] = None, estimate: Optional[dict] = None) -> dict:
     """将 FundMNFInfo 返回 (经 _normalize_row 归一化) + 持仓信息合成一行展示用数据。
 
     归一化字段: fundcode, name, jzrq (净值日期), dwjz (单位净值),
       gsz (估算净值), gszzl (估算涨跌幅%), gztime (估算时间), navchgrt (净值涨跌幅%)
-    数据源有两套涨跌幅:
-      - 盘中估算 gsz/gszzl (交易时段才有; 主动管理型基金可能始终没有)
-      - 净值涨跌幅 navchgrt (结算后即当日真实涨跌幅)
-    三态: 已结算 (净值日=估值日) 用 navchgrt; 有 gsz 用 gszzl 实时估算; 否则留空显示「-」。
+    数据源有三套涨跌幅来源 (优先级从高到低):
+      - 净值涨跌幅 navchgrt (已结算, 当日真实)
+      - 持仓自算估算 estimate (盘中, 基于重仓股+实时行情)
+      - 接口盘中估算 gsz/gszzl (盘中, 接口已下线场景的兜底)
+    四态: 已结算用 navchgrt; 有自算用 estimate; 有接口 gsz 用 gszzl; 否则留空显示「-」。
 
+    estimate: estimate_gsz() 返回的 {"gsz", "rate", "cov"} 或 None。
     expansion_gztime: API 响应级 Expansion.GZTIME，当单只基金 gztime 为 null 时
     作为 fallback 用于判定是否已结算（不影响最终展示的 gztime 字段）。
     """
@@ -395,6 +397,9 @@ def parse_fund(api_row: dict, holding: dict, expansion_gztime: Optional[str] = N
     gztime_for_settled = gztime or expansion_gztime
     settled = bool(pdate and pdate != "--" and gztime_for_settled and pdate == gztime_for_settled[:10])
 
+    est_gsz = estimate.get("gsz") if estimate else None
+    est_rate = estimate.get("rate") if estimate else None
+
     if settled:
         # 已结算: 涨跌幅与今日收益以净值涨跌幅为准 (当日真实)
         # 今日收益 = 今日净值 - 昨日净值; 昨日净值 = nav / (1 + 涨幅/100)
@@ -404,20 +409,36 @@ def parse_fund(api_row: dict, holding: dict, expansion_gztime: Optional[str] = N
         else:
             gains = None
         base_price = nav
+        gsz_out = None
+        est_source = "settled"
+    elif est_gsz is not None:
+        # 盘中持仓自算: 涨跌幅用 est_rate, 收益 = (估算净值 - 昨净值) × 份额
+        rate = est_rate
+        if nav is not None:
+            gains = (est_gsz - nav) * num
+        else:
+            gains = None
+        base_price = est_gsz
+        gsz_out = est_gsz
+        est_source = "holdings"
     elif gsz is not None:
-        # 盘中实时估算: 涨跌幅用 gszzl, 收益 = (估算净值 - 昨净值) × 份额
+        # 接口盘中估算(兜底): 涨跌幅用 gszzl, 收益 = (估算净值 - 昨净值) × 份额
         rate = gszzl
         if nav is not None:
             gains = (gsz - nav) * num
         else:
             gains = None
         base_price = gsz
+        gsz_out = gsz
+        est_source = "api"
     else:
-        # 无盘中估算且未结算 (主动型基金无盘中估值 / 收盘后净值未出):
+        # 无自算/无盘中估算且未结算 (主动型基金无盘中估值 / 收盘后净值未出):
         # 不用昨日 NAVCHGRT 冒充今日, 涨跌幅与今日收益留空, 显示「-」。
         rate = None
         gains = None
         base_price = nav  # 持有额按最近净值
+        gsz_out = None
+        est_source = "none"
 
     # 持有额
     amount = (base_price * num) if (base_price is not None) else None
@@ -433,9 +454,10 @@ def parse_fund(api_row: dict, holding: dict, expansion_gztime: Optional[str] = N
         "code": code,
         "name": name,
         "nav": nav,
-        "gsz": gsz,
+        "gsz": gsz_out,
         "rate": rate,
         "settled": settled,
+        "est_source": est_source,
         "amount": amount,
         "gains": gains,
         "cost": cost,
@@ -479,6 +501,8 @@ def rate_emoji(rate):
 def item_for_fund(f: dict) -> dict:
     if f["settled"]:
         flag = " ✓"
+    elif f.get("est_source") == "holdings":
+        flag = " [自算]"
     elif f["gsz"] is not None:
         flag = " [估算]"
     else:

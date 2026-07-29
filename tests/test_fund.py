@@ -68,5 +68,41 @@ class EstimateTest(unittest.TestCase):
         self.assertIsNotNone(est)  # 不因缺失而整体失败
 
 
+class ParseFundEstimateTest(unittest.TestCase):
+    def _row(self, gsz=None, gszzl=None, nav="1.0000", pdate="2026-07-28", navchgrt="1.50", gztime=None):
+        return {"fundcode": "240011", "name": "X", "dwjz": nav, "jzrq": pdate,
+                "gsz": gsz, "gszzl": gszzl, "gztime": gztime, "navchgrt": navchgrt}
+
+    def test_holdings_branch(self):
+        # 未结算(净值日 7-28 != 估值日 7-29), 估算注入 -> est_source=holdings
+        row = self._row(pdate="2026-07-28")
+        est = {"gsz": 1.0191, "rate": 1.91, "cov": 64.33}
+        f = fund.parse_fund(row, {"num": 100, "cost": None}, expansion_gztime="2026-07-29 10:00", estimate=est)
+        self.assertEqual(f["est_source"], "holdings")
+        self.assertAlmostEqual(f["gsz"], 1.0191, places=4)
+        self.assertAlmostEqual(f["rate"], 1.91, places=2)
+        self.assertAlmostEqual(f["gains"], (1.0191 - 1.0) * 100, places=2)
+
+    def test_api_gsz_branch_when_no_estimate(self):
+        row = self._row(gsz="1.0200", gszzl="2.00", pdate="2026-07-28")
+        f = fund.parse_fund(row, {"num": 100}, estimate=None)
+        self.assertEqual(f["est_source"], "api")
+        self.assertAlmostEqual(f["gsz"], 1.0200, places=4)
+
+    def test_settled_overrides_estimate(self):
+        # 净值日 == 估值日 -> 已结算, 用 NAVCHGRT, 忽略 estimate
+        row = self._row(pdate="2026-07-29", nav="1.0150", navchgrt="1.50", gztime="2026-07-29 15:00")
+        est = {"gsz": 1.0191, "rate": 1.91, "cov": 64.33}
+        f = fund.parse_fund(row, {"num": 100}, expansion_gztime="2026-07-29 15:00", estimate=est)
+        self.assertEqual(f["est_source"], "settled")
+        self.assertIsNone(f["gsz"])
+
+    def test_none_when_nothing(self):
+        row = self._row(gsz=None, pdate="2026-07-28")
+        f = fund.parse_fund(row, {"num": 100}, estimate=None)
+        self.assertEqual(f["est_source"], "none")
+        self.assertIsNone(f["gsz"])
+
+
 if __name__ == "__main__":
     unittest.main()
