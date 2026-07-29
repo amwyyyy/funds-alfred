@@ -2,33 +2,42 @@
 # -*- coding: utf-8 -*-
 """
 Alfred Script Filter: 查看自选基金当前情况
-数据源: 天天基金 FundValuationLast 批量估值接口
-  主域: https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast
-  备用: https://fundcomapi.eastmoney.com/mm/newCore/FundValuationLast
+数据源: 天天基金 FundMNFInfo 批量接口 (与 choose-funds / LiuRabt 扩展同款)
+  https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo
+  参数 plat=Android&appType=ttjj&product=EFund&Version=1, Fcodes 批量请求
 
-2026-07-21 起 fundgz.1234567.com.cn JSONP 端点 301 下线, 改用天天基金 H5
-FundComApi.getValuationLast 对应接口, 支持 FCODES 批量请求。
-部分主动管理型基金 GSZ/GSZZL/GZTIME 为 null (数据侧不再提供盘中估值),
-保留名称与正式净值并标注"无盘中估值"。
+接口提供两套涨跌幅:
+  - 盘中估算 GSZ/GSZZL/GZTIME (交易时段才有; 主动管理型基金可能始终没有)
+  - 净值涨跌幅 NAVCHGRT (结算后即当日真实涨跌幅)
+三态判定 (与 choose-funds 一致): 已结算 (净值日=估值日) 用 NAVCHGRT;
+有 GSZ 用盘中实时估算; 否则留空显示「-」, 不用昨日 NAVCHGRT 冒充今日。
 """
 
 import json
 import os
+import re
+import html
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from typing import Optional
 
 # ---------- 常量 ----------
-# 估值接口: 天天基金 FundValuationLast (批量, 主域失败回退备用域)
-API_HOSTS = (
-    "https://fundcomapi.tiantianfunds.com",
-    "https://fundcomapi.eastmoney.com",
-)
-API_PATH = "/mm/newCore/FundValuationLast"
-API_FIELDS = "FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE"
+# 估值接口: 天天基金 FundMNFInfo (批量, 与 choose-funds 扩展同款)
+API_URL = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo"
+DEVICE_ID = "00000000-0000-4000-8000-000000000000"  # 原项目用随机 UUID, 固定值即可
 TIMEOUT = 6  # seconds per request
+
+# 持仓自算估值常量
+SCALE_TO_FULL = True       # True=口径B(放大到满仓); False=口径A(其余按0)
+MIN_COVERAGE = 20.0        # 前十大占净值比低于此(%)视为不可信, 降级
+HOLDINGS_CACHE_DAYS = 7    # 持仓缓存有效期(天); 持仓是季报数据, 季度才变
+HOLDINGS_API = "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+STOCK_QUOTE_API = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 
 # 中式红涨绿跌
 EMOJI_UP = "📈"
@@ -118,7 +127,7 @@ _SSL_CTX = ssl.create_default_context()
 
 
 def _normalize_row(row: dict) -> dict:
-    """把 FundValuationLast 字段名归一化为旧 fundgz 字段名, 复用下游 parse_fund。"""
+    """把 FundMNFInfo 字段名归一化, 复用下游 parse_fund。"""
     return {
         "fundcode": row.get("FCODE"),
         "name": row.get("SHORTNAME"),
@@ -127,42 +136,164 @@ def _normalize_row(row: dict) -> dict:
         "gsz": row.get("GSZ"),
         "gszzl": row.get("GSZZL"),
         "gztime": row.get("GZTIME"),
+        "navchgrt": row.get("NAVCHGRT"),  # 净值涨跌幅, GSZ 缺失时兜底
     }
 
 
 def fetch_funds(codes):
-    """批量拉取基金估值。返回 {code: normalized_row_or_None}。
+    """批量拉取基金估值。返回 (results, expansion_gztime)。
 
-    单次请求拿回全部 codes; 不存在的 code 不会出现在响应 data 中 -> None (missing)。
-    主域失败自动回退备用域; 全部失败抛异常。
+    results: {code: normalized_row_or_None}
+    expansion_gztime: API 响应级 GZTIME（单只基金 GZTIME 为 null 时的 fallback）
+
+    使用天天基金 FundMNFInfo 批量端点; 不存在的 code 不会出现在 Datas 中 -> None (missing)。
     """
     out = {c: None for c in codes}
+    expansion_gztime = None
     if not codes:
-        return out
-    qs = urllib.parse.urlencode({"FCODES": ",".join(codes), "FIELDS": API_FIELDS})
-    last_err = None
-    for host in API_HOSTS:
-        url = f"{host}{API_PATH}?{qs}"
+        return out, expansion_gztime
+    qs = urllib.parse.urlencode({
+        "pageIndex": "1",
+        "pageSize": "200",
+        "plat": "Android",
+        "appType": "ttjj",
+        "product": "EFund",
+        "Version": "1",
+        "deviceid": DEVICE_ID,
+        "Fcodes": ",".join(codes),
+    })
+    req = urllib.request.Request(
+        f"{API_URL}?{qs}",
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
+            "Accept": "*/*",
+            "Referer": "https://fund.eastmoney.com/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    expansion = payload.get("Expansion") or {}
+    expansion_gztime = expansion.get("GZTIME")
+    for row in payload.get("Datas") or []:
+        c = row.get("FCODE")
+        if c:
+            out[c] = _normalize_row(row)
+    return out, expansion_gztime
+
+
+# ---------- 持仓与估算 ----------
+def get_holdings_cache_path() -> str:
+    return os.path.join(get_data_dir(), "holdings_cache.json")
+
+
+def load_holdings_cache() -> dict:
+    path = get_holdings_cache_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (ValueError, OSError):
+        return {}
+
+
+def save_holdings_cache(cache: dict) -> None:
+    with open(get_holdings_cache_path(), "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False)
+
+
+def _recent_quarter_ends(n: int = 4):
+    """返回最近 n 个季度末月 (year, month), newest-first。month ∈ {3,6,9,12}。"""
+    now = datetime.now()
+    qe = [3, 6, 9, 12]
+    si = 0
+    for i, qm in enumerate(qe):
+        if qm <= now.month:
+            si = i
+    out, i, year = [], si, now.year
+    while len(out) < n:
+        out.append((year, qe[i]))
+        i -= 1
+        if i < 0:
+            i = len(qe) - 1
+            year -= 1
+    return out
+
+
+def _parse_holdings_html(raw: str):
+    """解析 FundArchivesDatas jjcc HTML, 提取前十大重仓股。
+    返回 [{secid, name, weight}, ...], secid 形如 '1.600519'。"""
+    m = re.search(r"<tbody>(.*?)</tbody>", raw, re.S)
+    if not m:
+        return []
+    rows = re.findall(r"<tr>(.*?)</tr>", m.group(1), re.S)
+    out = []
+    for r in rows[:10]:
+        sec = re.search(r"unify/r/([01]\.\d{6})", r)
+        nm = re.search(r"class='tol'><a[^>]*>([^<]+)", r)
+        pct = re.search(r"class='tor'>([0-9]+\.[0-9]+)%", r)
+        if sec and nm and pct:
+            out.append({
+                "secid": sec.group(1),
+                "name": html.unescape(nm.group(1)),
+                "weight": float(pct.group(1)),
+            })
+    return out
+
+
+def _cache_fresh(entry: dict) -> bool:
+    fetched = entry.get("fetched_at")
+    if not fetched:
+        return False
+    age_days = (datetime.now() - datetime.fromtimestamp(fetched)).days
+    return age_days < HOLDINGS_CACHE_DAYS
+
+
+def _fetch_holdings_remote(code: str):
+    """逐季报倒推拉取, 返回 [{secid, name, weight}] 或 []。"""
+    for year, month in _recent_quarter_ends(4):
+        qs = urllib.parse.urlencode({
+            "type": "jjcc",
+            "code": code,
+            "topline": "10",
+            "year": str(year),
+            "month": str(month),
+        })
         req = urllib.request.Request(
-            url,
+            f"{HOLDINGS_API}?{qs}",
             headers={
                 "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
-                "Accept": "*/*",
-                "Referer": "https://fund.eastmoney.com/",
+                "Referer": "https://fundf10.eastmoney.com/",
             },
         )
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-        except Exception as e:
-            last_err = e
+                raw = resp.read().decode("utf-8", errors="replace")
+        except Exception:
             continue
-        for row in payload.get("data") or []:
-            c = row.get("FCODE")
-            if c:
-                out[c] = _normalize_row(row)
-        return out
-    raise last_err or RuntimeError("估值接口均不可用")
+        stocks = _parse_holdings_html(raw)
+        if stocks:
+            return stocks
+    return []
+
+
+def fetch_holdings(code: str):
+    """取基金前十大重仓股(带缓存)。失败/无季报返 []。"""
+    cache = load_holdings_cache()
+    entry = cache.get(code)
+    if entry and _cache_fresh(entry):
+        return entry.get("stocks") or []
+    stocks = _fetch_holdings_remote(code)
+    if stocks:
+        cache[code] = {
+            "stocks": stocks,
+            "fetched_at": datetime.now().timestamp(),
+        }
+        save_holdings_cache(cache)
+        return stocks
+    if entry:  # 远程失败时回退旧缓存(即便过期)
+        return entry.get("stocks") or []
+    return []
 
 
 # ---------- 计算 ----------
@@ -175,43 +306,64 @@ def to_float(x, default=None):
         return default
 
 
-def parse_fund(api_row: dict, holding: dict) -> dict:
-    """将估值接口返回 (经 _normalize_row 归一化) + 用户持仓信息合成一行展示用数据。
+def parse_fund(api_row: dict, holding: dict, expansion_gztime: Optional[str] = None) -> dict:
+    """将 FundMNFInfo 返回 (经 _normalize_row 归一化) + 持仓信息合成一行展示用数据。
 
     归一化字段: fundcode, name, jzrq (净值日期), dwjz (单位净值),
-      gsz (估算净值), gszzl (估算涨跌幅%), gztime (估算时间 'YYYY-mm-dd HH:MM')
-    gsz/gszzl/gztime 可能为 None (主动管理型基金无盘中估值)。
+      gsz (估算净值), gszzl (估算涨跌幅%), gztime (估算时间), navchgrt (净值涨跌幅%)
+    数据源有两套涨跌幅:
+      - 盘中估算 gsz/gszzl (交易时段才有; 主动管理型基金可能始终没有)
+      - 净值涨跌幅 navchgrt (结算后即当日真实涨跌幅)
+    三态: 已结算 (净值日=估值日) 用 navchgrt; 有 gsz 用 gszzl 实时估算; 否则留空显示「-」。
+
+    expansion_gztime: API 响应级 Expansion.GZTIME，当单只基金 gztime 为 null 时
+    作为 fallback 用于判定是否已结算（不影响最终展示的 gztime 字段）。
     """
     code = api_row.get("fundcode")
     name = api_row.get("name", code)
     nav = to_float(api_row.get("dwjz"))
     gsz = to_float(api_row.get("gsz"))
     gszzl = to_float(api_row.get("gszzl"))
+    navchgrt = to_float(api_row.get("navchgrt"))
     gztime = api_row.get("gztime")
     pdate = api_row.get("jzrq")
 
     num = float(holding.get("num") or 0)
     cost = to_float(holding.get("cost"))
 
-    # 判断是否已结算: 净值日期 == 估算时间的日期
-    # 已结算后 fundgz 的 gsz 通常等于 dwjz, gszzl 就是当日真实涨跌幅
-    settled = False
-    if pdate and pdate != "--" and gztime and pdate == gztime[:10]:
-        settled = True
+    # 是否已结算 (今日净值已公布): 净值日 == 估值日, 与 choose-funds 一致。
+    # 单只基金 GZTIME 在非交易时段为 null，此时用 API 响应级 Expansion.GZTIME 兜底判定。
+    gztime_for_settled = gztime or expansion_gztime
+    settled = bool(pdate and pdate != "--" and gztime_for_settled and pdate == gztime_for_settled[:10])
 
-    rate = gszzl  # 直接用估算涨跌幅 (已结算后它就是真实涨跌幅)
-
-    # 今日估算收益
-    if gsz is not None and nav is not None:
-        gains = (gsz - nav) * num
+    if settled:
+        # 已结算: 涨跌幅与今日收益以净值涨跌幅为准 (当日真实)
+        # 今日收益 = 今日净值 - 昨日净值; 昨日净值 = nav / (1 + 涨幅/100)
+        rate = navchgrt
+        if nav is not None and navchgrt is not None:
+            gains = (nav - nav / (1 + navchgrt / 100)) * num
+        else:
+            gains = None
+        base_price = nav
+    elif gsz is not None:
+        # 盘中实时估算: 涨跌幅用 gszzl, 收益 = (估算净值 - 昨净值) × 份额
+        rate = gszzl
+        if nav is not None:
+            gains = (gsz - nav) * num
+        else:
+            gains = None
+        base_price = gsz
     else:
+        # 无盘中估算且未结算 (主动型基金无盘中估值 / 收盘后净值未出):
+        # 不用昨日 NAVCHGRT 冒充今日, 涨跌幅与今日收益留空, 显示「-」。
+        rate = None
         gains = None
+        base_price = nav  # 持有额按最近净值
 
-    # 持有额: 优先用 gsz (实时), 退化到 dwjz
-    base_price = gsz if gsz is not None else nav
+    # 持有额
     amount = (base_price * num) if (base_price is not None) else None
 
-    # 持仓总收益 (cost 必填); 用 gsz 计算更贴近实时
+    # 持仓总收益 (cost 必填)
     cost_gains = None
     cost_rate = None
     if cost is not None and cost != 0 and base_price is not None:
@@ -268,10 +420,10 @@ def rate_emoji(rate):
 def item_for_fund(f: dict) -> dict:
     if f["settled"]:
         flag = " ✓"
-    elif f["rate"] is not None:
+    elif f["gsz"] is not None:
         flag = " [估算]"
     else:
-        flag = " [无盘中估值]"
+        flag = " [无估值]"
     title = f"{rate_emoji(f['rate'])} {f['name']} · {fmt_rate(f['rate'])}{flag}"
 
     parts = [f"持有 {fmt_money(f['amount'])}"]
@@ -319,10 +471,16 @@ def item_total(
     base = total_amount - total_gains
     rate = (total_gains * 100 / base) if base else None
 
+    # 全部基金无今日收益 (无盘中估值且未结算) 时, 不显示误导性的 0, 留空
+    if funds and all(f["gains"] is None for f in funds):
+        show_gains, show_rate = None, None
+    else:
+        show_gains, show_rate = total_gains, rate
+
     label = f"[{group_label}] " if group_label else ""
     title = (
-        f"{rate_emoji(rate)} {label}持有 {fmt_money(total_amount)}  ·  "
-        f"今日 {fmt_signed(total_gains)} ({fmt_rate(rate)})"
+        f"{rate_emoji(show_rate)} {label}持有 {fmt_money(total_amount)}  ·  "
+        f"今日 {fmt_signed(show_gains)} ({fmt_rate(show_rate)})"
     )
     parts = [f"{len(funds)} 只基金"]
     if have_cost:
@@ -332,7 +490,7 @@ def item_total(
 
     arg = (
         f"{label}持有 {fmt_money(total_amount)}  "
-        f"今日 {fmt_signed(total_gains)} ({fmt_rate(rate)})"
+        f"今日 {fmt_signed(show_gains)} ({fmt_rate(show_rate)})"
     )
     return {
         "uid": uid,
@@ -380,7 +538,7 @@ def cmd_sum(groups: list) -> None:
 
     # 并发拉一次, 全部分组共享
     try:
-        results = fetch_funds(unique_codes)
+        results, expansion_gztime = fetch_funds(unique_codes)
     except Exception as e:
         out = {"items": [item_error("网络请求失败", str(e))]}
         print(json.dumps(out, ensure_ascii=False))
@@ -389,25 +547,21 @@ def cmd_sum(groups: list) -> None:
     # 按分组聚合 parse_fund 结果
     group_parsed = [[] for _ in groups]
     latest_gztime = None
-    any_settled = False
-    all_settled = True
+    has_realtime = False  # 是否有盘中实时估算 (决定合计行标「估算」还是「净值」)
     for gi, code, h in holdings_ctx:
         r = results.get(code)
         if not r:
-            all_settled = False  # 缺失基金视为未结算, 影响 prefix
             continue
-        f = parse_fund(r, h)
+        f = parse_fund(r, h, expansion_gztime)
         group_parsed[gi].append(f)
-        gt = f.get("gztime")
+        gt = f.get("gztime") or f.get("pdate")
         if gt and (latest_gztime is None or gt > latest_gztime):
             latest_gztime = gt
-        if f["settled"]:
-            any_settled = True
-        else:
-            all_settled = False
+        if not f["settled"] and f["gsz"] is not None:
+            has_realtime = True
 
     if latest_gztime:
-        prefix = "净值" if any_settled and all_settled else "估算"
+        prefix = "估算" if has_realtime else "净值"
         when = f"{prefix} @ {latest_gztime}"
     else:
         when = datetime.now().strftime("更新 @ %H:%M")
@@ -534,7 +688,7 @@ def main():
 
     # 2. 并发拉取
     try:
-        results = fetch_funds(codes)
+        results, expansion_gztime = fetch_funds(codes)
     except Exception as e:
         out = {"items": [item_error("网络请求失败", str(e))]}
         print(json.dumps(out, ensure_ascii=False))
@@ -548,20 +702,20 @@ def main():
         if not r:
             missing.append(code)
             continue
-        parsed.append(parse_fund(r, holdings_by_code[code]))
+        parsed.append(parse_fund(r, holdings_by_code[code], expansion_gztime))
     parsed.sort(key=lambda f: (f["rate"] if f["rate"] is not None else -999), reverse=True)
 
     # 4. 拼参考时间 (用最新的 gztime)
     when = ""
     latest_gztime = None
     for f in parsed:
-        gt = f.get("gztime")
+        gt = f.get("gztime") or f.get("pdate")
         if gt and (latest_gztime is None or gt > latest_gztime):
             latest_gztime = gt
     if latest_gztime:
-        # 看看是不是已结算
-        any_settled = any(f["settled"] for f in parsed)
-        prefix = "净值" if any_settled and all(f["settled"] for f in parsed) else "估算"
+        # 有盘中实时估算才标「估算」, 否则 (已结算 / 无盘中估值) 都是「净值」
+        has_realtime = any((not f["settled"] and f["gsz"] is not None) for f in parsed)
+        prefix = "估算" if has_realtime else "净值"
         when = f"{prefix} @ {latest_gztime}"
     else:
         when = datetime.now().strftime("更新 @ %H:%M")
