@@ -15,6 +15,7 @@ Alfred Script Filter: 查看自选基金当前情况
 
 import json
 import os
+import random
 import re
 import html
 import subprocess
@@ -122,22 +123,32 @@ def normalize_groups(cfg: dict) -> list:
 
 
 # ---------- HTTP ----------
-def _curl_get_text(url: str, headers: Optional[dict] = None, timeout: int = TIMEOUT) -> str:
+def _curl_get_text(url: str, headers: Optional[dict] = None, timeout: int = TIMEOUT,
+                   retries: int = 2) -> str:
     """用 curl 子进程发起 GET, 返回响应文本, 失败返 ''。
 
     天天基金 push2 行情服务器对 Python urllib 的 TLS 指纹反爬 (直接 RST 连接,
     urllib 全部 RemoteDisconnected), 而 curl 的 TLS 指纹可通过。curl 为 macOS
     自带, 不破坏零依赖。fundmobapi/fundf10 当前 urllib 仍可用, 但统一走 curl
     更稳, 避免后续反爬升级再次"突然全 0"。
+
+    retries: 额外重试次数 (总共 retries+1 次), 指数退避 + 随机抖动。
     """
-    cmd = ["curl", "-sS", "-m", str(timeout), "--compressed", url]
-    for k, v in (headers or {}).items():
-        cmd += ["-H", f"{k}: {v}"]
-    try:
-        cp = subprocess.run(cmd, capture_output=True, timeout=timeout + 3)
-        return cp.stdout.decode("utf-8", errors="replace")
-    except Exception:
-        return ""
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            time.sleep(delay)
+        cmd = ["curl", "-sS", "-m", str(timeout), "--compressed", url]
+        for k, v in (headers or {}).items():
+            cmd += ["-H", f"{k}: {v}"]
+        try:
+            cp = subprocess.run(cmd, capture_output=True, timeout=timeout + 3)
+            text = cp.stdout.decode("utf-8", errors="replace")
+            if text.strip():
+                return text
+        except Exception:
+            pass
+    return ""
 
 
 def _normalize_row(row: dict) -> dict:
@@ -154,13 +165,14 @@ def _normalize_row(row: dict) -> dict:
     }
 
 
-def fetch_funds(codes):
+def fetch_funds(codes, retries=2):
     """批量拉取基金估值。返回 (results, expansion_gztime)。
 
     results: {code: normalized_row_or_None}
     expansion_gztime: API 响应级 GZTIME（单只基金 GZTIME 为 null 时的 fallback）
 
     使用天天基金 FundMNFInfo 批量端点; 不存在的 code 不会出现在 Datas 中 -> None (missing)。
+    遇到空响应或大量缺失时自动重试 (retries 次额外尝试)。
     """
     out = {c: None for c in codes}
     expansion_gztime = None
@@ -181,13 +193,20 @@ def fetch_funds(codes):
         "Accept": "*/*",
         "Referer": "https://fund.eastmoney.com/",
     }
-    payload = json.loads(_curl_get_text(f"{API_URL}?{qs}", req_headers) or "{}")
-    expansion = payload.get("Expansion") or {}
-    expansion_gztime = expansion.get("GZTIME")
-    for row in payload.get("Datas") or []:
-        c = row.get("FCODE")
-        if c:
-            out[c] = _normalize_row(row)
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            time.sleep(delay)
+        payload = json.loads(_curl_get_text(f"{API_URL}?{qs}", req_headers) or "{}")
+        expansion = payload.get("Expansion") or {}
+        expansion_gztime = expansion.get("GZTIME")
+        datas = payload.get("Datas") or []
+        if datas:  # 有数据直接返回, 不再重试
+            for row in datas:
+                c = row.get("FCODE")
+                if c:
+                    out[c] = _normalize_row(row)
+            return out, expansion_gztime
     return out, expansion_gztime
 
 
@@ -259,26 +278,30 @@ def _cache_fresh(entry: dict) -> bool:
     return age_days < HOLDINGS_CACHE_DAYS
 
 
-def _fetch_holdings_remote(code: str):
-    """逐季报倒推拉取, 返回 [{secid, name, weight}] 或 []。"""
-    for year, month in _recent_quarter_ends(4):
-        qs = urllib.parse.urlencode({
-            "type": "jjcc",
-            "code": code,
-            "topline": "10",
-            "year": str(year),
-            "month": str(month),
-        })
-        raw = _curl_get_text(
-            f"{HOLDINGS_API}?{qs}",
-            {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
-                "Referer": "https://fundf10.eastmoney.com/",
-            },
-        )
-        stocks = _parse_holdings_html(raw)
-        if stocks:
-            return stocks
+def _fetch_holdings_remote(code: str, retries: int = 1):
+    """逐季报倒推拉取, 返回 [{secid, name, weight}] 或 []。
+    全部季报失败时重试一轮 (retries 次额外尝试), 应对服务器临时错误页。"""
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            time.sleep(1.0 + random.uniform(0, 0.5))
+        for year, month in _recent_quarter_ends(4):
+            qs = urllib.parse.urlencode({
+                "type": "jjcc",
+                "code": code,
+                "topline": "10",
+                "year": str(year),
+                "month": str(month),
+            })
+            raw = _curl_get_text(
+                f"{HOLDINGS_API}?{qs}",
+                {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)",
+                    "Referer": "https://fundf10.eastmoney.com/",
+                },
+            )
+            stocks = _parse_holdings_html(raw)
+            if stocks:
+                return stocks
     return []
 
 
@@ -301,8 +324,11 @@ def fetch_holdings(code: str):
     return []
 
 
-def fetch_stock_quotes(secids):
-    """批量拉取股票当日涨跌幅。返回 {裸代码: 涨跌幅%}。失败返 {}。"""
+def fetch_stock_quotes(secids, retries=2):
+    """批量拉取股票当日涨跌幅。返回 {裸代码: 涨跌幅%}。失败返 {}。
+
+    遇到空行情时自动重试 (retries 次额外尝试), 因为空行情会导致所有基金自算估值降级。
+    """
     if not secids:
         return {}
     qs = urllib.parse.urlencode({
@@ -311,16 +337,22 @@ def fetch_stock_quotes(secids):
         "fields": "f12,f14,f2,f3",
         "_": str(int(time.time())),
     })
-    try:
-        payload = json.loads(_curl_get_text(f"{STOCK_QUOTE_API}?{qs}", {"User-Agent": "Mozilla/5.0"}) or "{}")
-    except (ValueError, TypeError):
-        return {}
-    out = {}
-    for d in ((payload.get("data") or {}).get("diff")) or []:
-        code = d.get("f12")
-        if code:
-            out[code] = to_float(d.get("f3"), default=0.0)
-    return out
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            time.sleep(delay)
+        try:
+            payload = json.loads(_curl_get_text(f"{STOCK_QUOTE_API}?{qs}", {"User-Agent": "Mozilla/5.0"}) or "{}")
+        except (ValueError, TypeError):
+            continue
+        out = {}
+        for d in ((payload.get("data") or {}).get("diff")) or []:
+            code = d.get("f12")
+            if code:
+                out[code] = to_float(d.get("f3"), default=0.0)
+        if out:  # 有行情数据直接返回
+            return out
+    return {}
 
 
 def estimate_gsz(nav, holdings, quotes, scale_to_full=SCALE_TO_FULL, min_coverage=MIN_COVERAGE):
@@ -391,12 +423,23 @@ def build_estimates(codes, results):
     return out
 
 
+# 港股指数代码 -> push2 secid。前缀不统一: 恒指/国企 100., 恒生科技 124.。
+# 仅收录 QDII 联接/指数基金可能跟踪的恒生系列指数, 其余未知代码返回空。
+HK_INDEX_SECID = {
+    "HSI": "100.HSI",
+    "HSCEI": "100.HSCEI",
+    "HSTECH": "124.HSTECH",
+}
+
+
 def _index_secid(index_code: str) -> str:
-    """指数代码 -> push2 secid。399xxx 深市(0.), 其余沪市(1.)。"""
+    """指数代码 -> push2 secid。399xxx 深市(0.), 其余沪市(1.); 港股指数走映射表。"""
     if not index_code:
         return ""
-    market = "0" if index_code.startswith("399") else "1"
-    return f"{market}.{index_code}"
+    if index_code.isdigit():
+        market = "0" if index_code.startswith("399") else "1"
+        return f"{market}.{index_code}"
+    return HK_INDEX_SECID.get(index_code, "")
 
 
 def estimate_gsz_by_index(nav, index_code, quotes):
@@ -420,7 +463,8 @@ def fetch_fund_detail(code: str):
     cache = load_holdings_cache()
     entry = cache.get(code) or {}
     idx = entry.get("indexcode")
-    if idx and _cache_fresh(entry):
+    # 过滤无效缓存值 (旧版可能缓存了 "--" 等占位符)
+    if idx and idx != "--" and _cache_fresh(entry):
         return idx
     qs = urllib.parse.urlencode({
         "FCODE": code,
@@ -436,15 +480,20 @@ def fetch_fund_detail(code: str):
             {"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"},
         ) or "{}")
         datas = payload.get("Datas") or {}
-        idx = datas.get("INDEXCODE") or None
+        raw_idx = (datas.get("INDEXCODE") or "").strip()
+        # 过滤无效占位符 (空 / "--" 等), 保留数字与港股字母代码(如 HSTECH)
+        idx = raw_idx if (raw_idx and raw_idx != "--") else None
     except Exception:
         idx = None
-    if idx:
+    if idx is not None:
         cache[code] = {**entry, "indexcode": idx, "fetched_at": datetime.now().timestamp()}
         save_holdings_cache(cache)
-    elif entry.get("indexcode"):
-        return entry["indexcode"]  # 远程失败回退旧缓存
-    return idx
+        return idx
+    # 远程失败回退: 仅当旧缓存为有效值时才使用
+    old_idx = entry.get("indexcode")
+    if old_idx and old_idx != "--":
+        return old_idx
+    return None
 
 
 # ---------- 计算 ----------
