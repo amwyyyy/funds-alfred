@@ -671,7 +671,6 @@ def item_for_fund(f: dict) -> dict:
         arg += f"  持仓 {fmt_signed(f['cost_gains'])} ({fmt_rate(f['cost_rate'])})"
 
     return {
-        "uid": f"fund-{f['code']}",
         "title": title,
         "subtitle": subtitle,
         "arg": arg,
@@ -681,9 +680,7 @@ def item_for_fund(f: dict) -> dict:
     }
 
 
-def item_total(
-    funds: list, when_text: str, group_label: str = "", uid: str = "fund-total"
-) -> dict:
+def item_total(funds: list, when_text: str, group_label: str = "") -> dict:
     total_amount = sum((f["amount"] or 0) for f in funds)
     total_gains = sum((f["gains"] or 0) for f in funds)
     total_cost_gains = sum(
@@ -717,7 +714,6 @@ def item_total(
         f"今日 {fmt_signed(show_gains)} ({fmt_rate(show_rate)})"
     )
     return {
-        "uid": uid,
         "title": title,
         "subtitle": subtitle,
         "arg": arg,
@@ -810,18 +806,17 @@ def cmd_sum(groups: list) -> None:
     # 顶部: 全部分组总合计
     all_parsed = [f for fs in group_parsed for f in fs]
     if all_parsed:
-        items.append(item_total(all_parsed, when, "全部分组", uid="sum-all"))
+        items.append(item_total(all_parsed, when, "全部分组"))
 
     # 每个分组的合计行 (无明细基金)
     for gi, g in enumerate(groups):
         funds = group_parsed[gi]
         configured = len(g.get("funds") or [])
         if funds:
-            items.append(item_total(funds, when, g["name"], uid=f"sum-group-{gi}"))
+            items.append(item_total(funds, when, g["name"]))
         else:
             items.append(
                 {
-                    "uid": f"sum-group-{gi}",
                     "title": f"➖ [{g['name']}] 无基金可估算",
                     "subtitle": f"配置 {configured} 只, 0 只取到估值",
                     "valid": False,
@@ -835,7 +830,6 @@ def item_open_config(reason: str = "") -> dict:
     path = get_config_path()
     subtitle = reason or "回车在默认文本编辑器中打开"
     return {
-        "uid": "fund-config",
         "title": "⚙️  编辑 funds.json",
         "subtitle": f"{subtitle}  ·  {path}",
         "arg": path,
@@ -846,7 +840,6 @@ def item_open_config(reason: str = "") -> dict:
 
 def item_error(title: str, subtitle: str) -> dict:
     return {
-        "uid": "fund-error",
         "title": f"❌ {title}",
         "subtitle": subtitle,
         "arg": "",
@@ -872,7 +865,6 @@ def main():
             os.remove(path)
         out = {
             "items": [{
-                "uid": "fund-refresh",
                 "title": "♻️ 持仓缓存已清空" if removed else "♻️ 无缓存可清",
                 "subtitle": "下次查询会重新拉取重仓股持仓（季报数据）",
                 "arg": "",
