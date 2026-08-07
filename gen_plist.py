@@ -11,13 +11,15 @@ WORKDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflow")
 
 # 固定 UID (保持稳定，重新生成时不变)
 UID_SCRIPTFILTER = "A1F1F0A0-0000-0000-0000-000000000001"
-UID_CONDITIONAL = "A1F1F0A0-0000-0000-0000-000000000002"
-UID_CLIPBOARD = "A1F1F0A0-0000-0000-0000-000000000003"
-UID_OPENFILE = "A1F1F0A0-0000-0000-0000-000000000004"
+UID_RUNSCRIPT = "A1F1F0A0-0000-0000-0000-000000000003"
 
-# 条件分支输出端口 UID
-COND_OUT_OPEN = "B0000000-0000-0000-0000-000000000010"
-COND_OUT_ELSE = "B0000000-0000-0000-0000-000000000020"
+# 回车动作: 普通行复制到剪贴板; __CONFIG__: 前缀的行打开配置文件
+RUN_SCRIPT = (
+    'q="$1"; '
+    'if [[ "$q" == __CONFIG__:* ]]; then '
+    'open "${q#__CONFIG__:}"; '
+    'else printf "%s" "$q" | pbcopy; fi'
+)
 
 plist = {
     "bundleid": BUNDLE,
@@ -25,27 +27,11 @@ plist = {
     "connections": {
         UID_SCRIPTFILTER: [
             {
-                "destinationuid": UID_CONDITIONAL,
+                "destinationuid": UID_RUNSCRIPT,
                 "modifiers": 0,
                 "modifiersubtext": "",
                 "vitoclose": False,
             }
-        ],
-        UID_CONDITIONAL: [
-            {
-                "destinationuid": UID_OPENFILE,
-                "modifiers": 0,
-                "modifiersubtext": "",
-                "sourceoutputuid": COND_OUT_OPEN,
-                "vitoclose": False,
-            },
-            {
-                "destinationuid": UID_CLIPBOARD,
-                "modifiers": 0,
-                "modifiersubtext": "",
-                "sourceoutputuid": COND_OUT_ELSE,
-                "vitoclose": False,
-            },
         ],
     },
     "createdby": "denis",
@@ -71,7 +57,7 @@ plist = {
                 "script": '"/usr/bin/python3" fund.py "$1"',
                 "scriptargtype": 1,  # pass {query} as argv
                 "scriptfile": "",
-                "subtext": "回车: 复制概要 · fund N: 切组 · fund sum: 跨组合计 · fund config: 编辑",
+                "subtext": "回车: 复制基金代码 · ⌘C: 复制概要 · fund N: 切组 · fund sum: 跨组合计 · fund config: 编辑",
                 "title": "自选基金",
                 "type": 0,  # /bin/bash
                 "withspace": True,
@@ -80,48 +66,24 @@ plist = {
             "uid": UID_SCRIPTFILTER,
             "version": 3,
         },
-        # 2. Conditional (根据 {var:action} 决定走哪个分支)
+        # 2. Run Script: 回车分派 (复制 or 打开配置)
         {
             "config": {
-                "conditions": [
-                    {
-                        "inputstring": "{var:action}",
-                        "matchcasesensitive": False,
-                        "matchmode": 0,  # is equal to
-                        "matchstring": "open_config",
-                        "outputlabel": "edit",
-                        "uid": COND_OUT_OPEN,
-                    }
-                ],
-                "elselabel": "copy",
-                "elseuid": COND_OUT_ELSE,
-                "outputvarname": "",
-                "outputvarvalue": "",
+                "concurrently": False,
+                "escaping": 104,
+                "keyword": "",
+                "queuedelaycustom": 3,
+                "queuedelayimmediatelyinitially": True,
+                "queuedelaymode": 0,
+                "queuemode": 1,
+                "runtime": "/bin/zsh",
+                "script": RUN_SCRIPT,
+                "scriptargtype": 1,
+                "scriptfile": "",
+                "type": 0,
             },
-            "type": "alfred.workflow.utility.conditional",
-            "uid": UID_CONDITIONAL,
-            "version": 1,
-        },
-        # 3. Copy to Clipboard
-        {
-            "config": {
-                "autopaste": False,
-                "clipboardtext": "{query}",
-                "ignoredynamicplaceholders": False,
-                "transient": False,
-            },
-            "type": "alfred.workflow.output.clipboard",
-            "uid": UID_CLIPBOARD,
-            "version": 3,
-        },
-        # 4. Open File
-        {
-            "config": {
-                "openwith": "",
-                "sourcefile": "{query}",
-            },
-            "type": "alfred.workflow.action.openfile",
-            "uid": UID_OPENFILE,
+            "type": "alfred.workflow.action.script",
+            "uid": UID_RUNSCRIPT,
             "version": 2,
         },
     ],
@@ -132,14 +94,14 @@ plist = {
         "- `fund`         查看自选基金 (默认第 1 组)\n"
         "- `fund N`       切换到第 N 个分组 (1-based)\n"
         "- `fund sum`     跨所有分组合计 (只显示合计行, 不展示单只基金)\n"
-        "- `fund config`  打开配置文件 funds.json 增删基金/分组\n\n"
+        "- `fund config`  打开配置文件 funds.json 增删基金/分组\n"
+        "  - 基金行/合计行回车: 复制基金代码(合计行复制概要)\n"
+        "  - ⌘C: 复制完整概要\n\n"
         "首次运行会在 Alfred Workflow Data 目录下生成示例配置 (含分组示例)。\n"
     ),
     "uidata": {
         UID_SCRIPTFILTER: {"xpos": 30, "ypos": 110},
-        UID_CONDITIONAL: {"xpos": 290, "ypos": 110},
-        UID_CLIPBOARD: {"xpos": 560, "ypos": 200},
-        UID_OPENFILE: {"xpos": 560, "ypos": 50},
+        UID_RUNSCRIPT: {"xpos": 560, "ypos": 110},
     },
     "variablesdontexport": [],
     "version": "1.0.0",

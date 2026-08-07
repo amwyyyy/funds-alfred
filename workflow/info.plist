@@ -12,38 +12,11 @@
 		<array>
 			<dict>
 				<key>destinationuid</key>
-				<string>A1F1F0A0-0000-0000-0000-000000000002</string>
-				<key>modifiers</key>
-				<integer>0</integer>
-				<key>modifiersubtext</key>
-				<string></string>
-				<key>vitoclose</key>
-				<false/>
-			</dict>
-		</array>
-		<key>A1F1F0A0-0000-0000-0000-000000000002</key>
-		<array>
-			<dict>
-				<key>destinationuid</key>
-				<string>A1F1F0A0-0000-0000-0000-000000000004</string>
-				<key>modifiers</key>
-				<integer>0</integer>
-				<key>modifiersubtext</key>
-				<string></string>
-				<key>sourceoutputuid</key>
-				<string>B0000000-0000-0000-0000-000000000010</string>
-				<key>vitoclose</key>
-				<false/>
-			</dict>
-			<dict>
-				<key>destinationuid</key>
 				<string>A1F1F0A0-0000-0000-0000-000000000003</string>
 				<key>modifiers</key>
 				<integer>0</integer>
 				<key>modifiersubtext</key>
 				<string></string>
-				<key>sourceoutputuid</key>
-				<string>B0000000-0000-0000-0000-000000000020</string>
 				<key>vitoclose</key>
 				<false/>
 			</dict>
@@ -93,7 +66,7 @@
 				<key>scriptfile</key>
 				<string></string>
 				<key>subtext</key>
-				<string>回车: 复制概要 · fund N: 切组 · fund sum: 跨组合计 · fund config: 编辑</string>
+				<string>回车: 复制基金代码 · ⌘C: 复制概要 · fund N: 切组 · fund sum: 跨组合计 · fund config: 编辑</string>
 				<key>title</key>
 				<string>自选基金</string>
 				<key>type</key>
@@ -111,70 +84,35 @@
 		<dict>
 			<key>config</key>
 			<dict>
-				<key>conditions</key>
-				<array>
-					<dict>
-						<key>inputstring</key>
-						<string>{var:action}</string>
-						<key>matchcasesensitive</key>
-						<false/>
-						<key>matchmode</key>
-						<integer>0</integer>
-						<key>matchstring</key>
-						<string>open_config</string>
-						<key>outputlabel</key>
-						<string>edit</string>
-						<key>uid</key>
-						<string>B0000000-0000-0000-0000-000000000010</string>
-					</dict>
-				</array>
-				<key>elselabel</key>
-				<string>copy</string>
-				<key>elseuid</key>
-				<string>B0000000-0000-0000-0000-000000000020</string>
-				<key>outputvarname</key>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>104</integer>
+				<key>keyword</key>
 				<string></string>
-				<key>outputvarvalue</key>
+				<key>queuedelaycustom</key>
+				<integer>3</integer>
+				<key>queuedelayimmediatelyinitially</key>
+				<true/>
+				<key>queuedelaymode</key>
+				<integer>0</integer>
+				<key>queuemode</key>
+				<integer>1</integer>
+				<key>runtime</key>
+				<string>/bin/zsh</string>
+				<key>script</key>
+				<string>q="$1"; if [[ "$q" == __CONFIG__:* ]]; then open "${q#__CONFIG__:}"; else printf "%s" "$q" | pbcopy; fi</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
 				<string></string>
+				<key>type</key>
+				<integer>0</integer>
 			</dict>
 			<key>type</key>
-			<string>alfred.workflow.utility.conditional</string>
-			<key>uid</key>
-			<string>A1F1F0A0-0000-0000-0000-000000000002</string>
-			<key>version</key>
-			<integer>1</integer>
-		</dict>
-		<dict>
-			<key>config</key>
-			<dict>
-				<key>autopaste</key>
-				<false/>
-				<key>clipboardtext</key>
-				<string>{query}</string>
-				<key>ignoredynamicplaceholders</key>
-				<false/>
-				<key>transient</key>
-				<false/>
-			</dict>
-			<key>type</key>
-			<string>alfred.workflow.output.clipboard</string>
+			<string>alfred.workflow.action.script</string>
 			<key>uid</key>
 			<string>A1F1F0A0-0000-0000-0000-000000000003</string>
-			<key>version</key>
-			<integer>3</integer>
-		</dict>
-		<dict>
-			<key>config</key>
-			<dict>
-				<key>openwith</key>
-				<string></string>
-				<key>sourcefile</key>
-				<string>{query}</string>
-			</dict>
-			<key>type</key>
-			<string>alfred.workflow.action.openfile</string>
-			<key>uid</key>
-			<string>A1F1F0A0-0000-0000-0000-000000000004</string>
 			<key>version</key>
 			<integer>2</integer>
 		</dict>
@@ -190,6 +128,8 @@
 - `fund N`       切换到第 N 个分组 (1-based)
 - `fund sum`     跨所有分组合计 (只显示合计行, 不展示单只基金)
 - `fund config`  打开配置文件 funds.json 增删基金/分组
+  - 基金行/合计行回车: 复制基金代码(合计行复制概要)
+  - ⌘C: 复制完整概要
 
 首次运行会在 Alfred Workflow Data 目录下生成示例配置 (含分组示例)。
 </string>
@@ -202,26 +142,12 @@
 			<key>ypos</key>
 			<integer>110</integer>
 		</dict>
-		<key>A1F1F0A0-0000-0000-0000-000000000002</key>
-		<dict>
-			<key>xpos</key>
-			<integer>290</integer>
-			<key>ypos</key>
-			<integer>110</integer>
-		</dict>
 		<key>A1F1F0A0-0000-0000-0000-000000000003</key>
 		<dict>
 			<key>xpos</key>
 			<integer>560</integer>
 			<key>ypos</key>
-			<integer>200</integer>
-		</dict>
-		<key>A1F1F0A0-0000-0000-0000-000000000004</key>
-		<dict>
-			<key>xpos</key>
-			<integer>560</integer>
-			<key>ypos</key>
-			<integer>50</integer>
+			<integer>110</integer>
 		</dict>
 	</dict>
 	<key>variablesdontexport</key>

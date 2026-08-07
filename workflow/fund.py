@@ -660,22 +660,23 @@ def item_for_fund(f: dict) -> dict:
     parts.append(nav_part)
     subtitle = "  ·  ".join(parts)
 
-    # 按 ⏎ 时复制到剪贴板
-    arg = (
+    # 按 ⏎ 时复制到剪贴板：回车复制基金代码；⌘C 复制完整概要
+    arg = f["code"]
+    summary = (
         f"{f['name']} {f['code']}  "
         f"{fmt_rate(f['rate'])}  "
         f"今日 {fmt_signed(f['gains'])}  "
         f"持有 {fmt_money(f['amount'])}"
     )
     if f["cost_gains"] is not None:
-        arg += f"  持仓 {fmt_signed(f['cost_gains'])} ({fmt_rate(f['cost_rate'])})"
+        summary += f"  持仓 {fmt_signed(f['cost_gains'])} ({fmt_rate(f['cost_rate'])})"
 
     return {
         "title": title,
         "subtitle": subtitle,
         "arg": arg,
         "match": f"{f['name']} {f['code']}",
-        "text": {"copy": arg, "largetype": arg},
+        "text": {"copy": summary, "largetype": summary},
         "valid": True,
     }
 
@@ -828,12 +829,12 @@ def cmd_sum(groups: list) -> None:
 
 def item_open_config(reason: str = "") -> dict:
     path = get_config_path()
-    subtitle = reason or "回车在默认文本编辑器中打开"
+    subtitle = reason or "回车打开配置文件"
     return {
         "title": "⚙️  编辑 funds.json",
         "subtitle": f"{subtitle}  ·  {path}",
-        "arg": path,
-        "variables": {"action": "open_config"},
+        # 带 __CONFIG__: 前缀, 回车时由 Run Script 识别并 open 该路径
+        "arg": f"__CONFIG__:{path}",
         "valid": True,
     }
 
