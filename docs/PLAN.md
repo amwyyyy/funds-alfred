@@ -94,6 +94,8 @@ jsonpgz({"fundcode":"161725","name":"招商中证白酒指数(LOF)A",
 
 > 📌 **2026-07-29 三次调整**：`FundMNFInfo` 对多数基金也不再返回 `GSZ`（盘中实时估值彻底无接口来源）。新增「持仓自算估值」：盘中未结算时，用基金最新季报前十大重仓股 + 占净值比 + 重仓股实时行情加权估算净值（口径 B：按重仓覆盖率缩放到满仓），标注 `[自算]`。重仓覆盖率不足时（如 ETF 联接基金仅 0.3%）回退用 `FundMNDetailInformation.INDEXCODE` 跟踪指数实时涨跌估算。持仓缓存 7 天，`fund refresh` 强制刷新。降级链：持仓自算 -> 跟踪指数自算 -> 接口 GSZ -> `NAVCHGRT` -> `[无估值]`。详见 `docs/superpowers/specs/2026-07-29-holdings-based-fund-valuation-design.md`。
 
+> 📌 **2026-08-17 四次调整**：008163（南方标普红利低波50ETF联接A）无估值——其跟踪指数 `SPCLLHCP`（标普中国A股大盘红利低波50）在东方财富行情系统无代码（push2 查不到），指数回退落空。新增「母 ETF 行情推估」：对无法直查行情的字母指数，按 `LINKED_ETF_BY_INDEX` 映射（`SPCLLHCP -> 515450`）取母 ETF 场内实时涨跌推估联接基金净值。`_index_secid` 同时修正 `159xxx` 深市 ETF 的市场前缀。降级链扩充为：持仓自算 -> 跟踪指数自算 -> 母 ETF 行情 -> 接口 GSZ -> `NAVCHGRT` -> `[无估值]`。
+
 字段映射：
 - `dwjz` → 单位净值（昨日结算）
 - `gsz` / `gszzl` → 估算净值 / 估算涨跌幅

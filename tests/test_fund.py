@@ -1,6 +1,7 @@
 import sys
 import os
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "workflow"))
 import fund
@@ -83,6 +84,36 @@ class IndexSecidTest(unittest.TestCase):
         # 399997 中证白酒 -> 深市 0.
         self.assertEqual(fund._index_secid("399997"), "0.399997")
 
+    def test_sz_etf(self):
+        # 159 开头深市 ETF (如 159915) -> 深市 0.
+        self.assertEqual(fund._index_secid("159915"), "0.159915")
+
+    def test_linked_etf_mapping(self):
+        # 标普指数 SPCLLHCP 无法直接查行情 -> 映射到母 ETF 515450 (沪市 1.)
+        self.assertEqual(fund._index_secid("SPCLLHCP"), "1.515450")
+
+    def test_unknown_letter_code_empty(self):
+        # 未知字母代码 (非港股/母ETF映射) -> 空
+        self.assertEqual(fund._index_secid("NOPEXX"), "")
+
+
+class IndexQuoteCodeTest(unittest.TestCase):
+    """INDEXCODE -> 可查行情载体 (裸代码)。数字/港股字母原样, 其余查母ETF映射。"""
+
+    def test_numeric_passthrough(self):
+        self.assertEqual(fund._index_quote_code("000688"), "000688")
+        self.assertEqual(fund._index_quote_code("399997"), "399997")
+
+    def test_hk_letter_passthrough(self):
+        self.assertEqual(fund._index_quote_code("HSTECH"), "HSTECH")
+
+    def test_linked_etf_resolved(self):
+        self.assertEqual(fund._index_quote_code("SPCLLHCP"), "515450")
+
+    def test_unknown_empty(self):
+        self.assertEqual(fund._index_quote_code("NOPEXX"), "")
+        self.assertEqual(fund._index_quote_code(""), "")
+
 
 class IndexEstimateTest(unittest.TestCase):
     def test_index_estimate(self):
@@ -134,6 +165,31 @@ class ParseFundEstimateTest(unittest.TestCase):
         f = fund.parse_fund(row, {"num": 100}, estimate=None)
         self.assertEqual(f["est_source"], "none")
         self.assertIsNone(f["gsz"])
+
+
+class BuildEstimatesLinkedEtfTest(unittest.TestCase):
+    """008163 场景: 持仓覆盖不足 + INDEXCODE=SPCLLHCP 无法直查行情
+    -> build_estimates 经母 ETF 515450 行情回退出估值。"""
+
+    RESULT = {"008163": {"fundcode": "008163", "dwjz": "1.0301", "jzrq": "2026-08-14",
+                         "gsz": None, "gszzl": None, "gztime": None, "navchgrt": "-0.48"}}
+
+    def test_falls_back_to_linked_etf(self):
+        with mock.patch.object(fund, "fetch_holdings", return_value=[]), \
+             mock.patch.object(fund, "fetch_fund_detail", return_value="SPCLLHCP"), \
+             mock.patch.object(fund, "fetch_stock_quotes", return_value={"515450": 1.23}):
+            est = fund.build_estimates(["008163"], self.RESULT)["008163"]
+        self.assertIsNotNone(est)
+        self.assertAlmostEqual(est["rate"], 1.23, places=2)
+        self.assertAlmostEqual(est["gsz"], 1.0301 * (1 + 1.23 / 100), places=4)
+
+    def test_linked_etf_missing_quote_still_none(self):
+        # 行情里没有母 ETF 代码 -> 保持无估值 (不编造)
+        with mock.patch.object(fund, "fetch_holdings", return_value=[]), \
+             mock.patch.object(fund, "fetch_fund_detail", return_value="SPCLLHCP"), \
+             mock.patch.object(fund, "fetch_stock_quotes", return_value={"600519": 2.0}):
+            est = fund.build_estimates(["008163"], self.RESULT)["008163"]
+        self.assertIsNone(est)
 
 
 if __name__ == "__main__":

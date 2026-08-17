@@ -418,7 +418,9 @@ def build_estimates(codes, results):
         if est is None:
             idx = detail_by_code.get(code)
             if idx:
-                est = estimate_gsz_by_index(nav, idx, quotes)
+                qc = _index_quote_code(idx)
+                if qc:
+                    est = estimate_gsz_by_index(nav, qc, quotes)
         out[code] = est
     return out
 
@@ -431,15 +433,38 @@ HK_INDEX_SECID = {
     "HSTECH": "124.HSTECH",
 }
 
+# 无法直接查行情的非数字跟踪指数 -> 母 ETF 场内代码 (push2 有实时行情)。
+# 用于「标的为非国产交易所指数」的联接基金 (如标普系列): 盘中无 GSZ、
+# 持仓覆盖率又低时, 用母 ETF 当日涨跌幅近似联接基金净值涨跌 (场内价有折溢价, 估算够用)。
+LINKED_ETF_BY_INDEX = {
+    "SPCLLHCP": "515450",  # 标普中国A股大盘红利低波50 -> 南方标普红利低波50ETF(515450)
+}
 
-def _index_secid(index_code: str) -> str:
-    """指数代码 -> push2 secid。399xxx 深市(0.), 其余沪市(1.); 港股指数走映射表。"""
+
+def _index_quote_code(index_code: str) -> str:
+    """INDEXCODE -> 可查行情的载体代码 (裸代码)。
+
+    数字指数(399xxx/000xxx/930xxx 等)与港股字母(HSI/HSCEI/HSTECH)原样返回;
+    其余字母代码(标普等)经 LINKED_ETF_BY_INDEX 查母 ETF 代码, 查不到返 ''。
+    """
     if not index_code:
         return ""
-    if index_code.isdigit():
-        market = "0" if index_code.startswith("399") else "1"
-        return f"{market}.{index_code}"
-    return HK_INDEX_SECID.get(index_code, "")
+    if index_code.isdigit() or index_code in HK_INDEX_SECID:
+        return index_code
+    return LINKED_ETF_BY_INDEX.get(index_code, "")
+
+
+def _index_secid(index_code: str) -> str:
+    """指数/母ETF载体代码 -> push2 secid。
+    399xxx 深市指数、159xxx 深市 ETF 用 0., 其余数字(含沪市 5xxxxx ETF)用 1.;
+    港股指数走映射表。"""
+    code = _index_quote_code(index_code)
+    if not code:
+        return ""
+    if code.isdigit():
+        market = "0" if code.startswith(("399", "159")) else "1"
+        return f"{market}.{code}"
+    return HK_INDEX_SECID.get(code, "")
 
 
 def estimate_gsz_by_index(nav, index_code, quotes):
