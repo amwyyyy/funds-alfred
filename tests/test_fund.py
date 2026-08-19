@@ -1,6 +1,11 @@
 import sys
 import os
+import io
+import json
+import shutil
+import tempfile
 import unittest
+import contextlib
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "workflow"))
@@ -11,6 +16,99 @@ class CurlGetTest(unittest.TestCase):
     def test_failure_returns_empty(self):
         # 不可达地址 -> 返回 "" (不抛异常)
         self.assertEqual(fund._curl_get_text("http://127.0.0.1:1/x", timeout=2), "")
+
+
+class RetryTest(unittest.TestCase):
+    def test_backoff_delay_grows(self):
+        # 重试间隔逐次加长: 1~1.5s, 2~2.5s, 4~4.5s, 8~8.5s ...
+        delays = [fund._backoff_delay(i) for i in range(1, 6)]
+        for i in range(1, len(delays)):
+            self.assertGreater(delays[i], delays[i - 1])
+
+    def test_backoff_delay_base_scale(self):
+        # 抖动 a 指数增长是确定的: delay - jitter <= BASE*2^(n-1)
+        for i in range(1, 5):
+            d = fund._backoff_delay(i)
+            expected = fund.RETRY_DELAY_BASE * (2 ** (i - 1))
+            self.assertLess(d, expected + fund.RETRY_DELAY_JITTER)
+
+    def test_fetch_funds_retries_then_succeeds(self):
+        # 前 4 次空响应(限流), 第 5 次成功 -> 外层共调用 5 次 (RETRIES=4),
+        # 且内层 _curl_get_text 只发单次请求 (不嵌套放大)
+        calls = {"n": 0}
+
+        def fake(url, headers=None, timeout=None, retries=0):
+            calls["n"] += 1
+            if calls["n"] < fund.RETRIES + 1:
+                return '{"Datas": []}'
+            return '{"Datas": [{"FCODE": "161725", "SHORTNAME": "测试基"}]}'
+
+        with mock.patch.object(fund, "_curl_get_text", side_effect=fake) as m, \
+             mock.patch("fund.time.sleep"):
+            out, _ = fund.fetch_funds(["161725"])
+        self.assertEqual(m.call_count, fund.RETRIES + 1)
+        self.assertEqual(out["161725"]["fundcode"], "161725")
+
+    def test_fetch_funds_gives_up_on_persistent_failure(self):
+        # 一直空响应 -> 重试 RETRIES 次后返回全 None, 不无限重试
+        with mock.patch.object(fund, "_curl_get_text", return_value='{"Datas": []}') as m, \
+             mock.patch("fund.time.sleep"):
+            out, _ = fund.fetch_funds(["161725"])
+        self.assertEqual(m.call_count, fund.RETRIES + 1)
+        self.assertIsNone(out["161725"])
+
+
+class QueryLockTest(unittest.TestCase):
+    """跨进程互斥锁: 查询进行中时新请求被忽略, 崩溃残留锁可接管。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        patcher = mock.patch.object(fund, "get_data_dir", return_value=self.tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_acquire_then_busy_then_release(self):
+        lock = fund._acquire_query_lock()
+        self.assertIsNotNone(lock)
+        # 仍持有锁时, 第二个请求拿不到 -> 应被忽略
+        self.assertIsNone(fund._acquire_query_lock())
+        self.assertTrue(fund._lock_busy(lock))
+        fund._release_query_lock(lock)
+        # 释放后重新可获取
+        self.assertIsNotNone(fund._acquire_query_lock())
+
+    def test_stale_lock_is_reclaimed(self):
+        lock = fund._acquire_query_lock()
+        # 模拟持有者进程已死: 写入一个不存在的 PID + 很久以前的时间戳
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write("999999 1000000000\n")
+        self.assertFalse(fund._lock_busy(lock))
+        # stale 锁应被清理接管, 而不是永久阻塞
+        self.assertIsNotNone(fund._acquire_query_lock())
+
+    def test_main_ignores_new_query_while_busy(self):
+        # 已有一个锁持有者 -> main() 不执行查询主体, 输出忙碌提示
+        fund._acquire_query_lock()
+        buf = io.StringIO()
+        with mock.patch.object(fund, "_run_query") as run_mock, \
+             mock.patch("sys.argv", ["fund.py", ""]), \
+             contextlib.redirect_stdout(buf):
+            fund.main()
+        run_mock.assert_not_called()
+        out = buf.getvalue()
+        self.assertIn("查询进行中", out)
+        self.assertIn("忽略", out)
+        fund._release_query_lock(fund._lock_file_path())
+
+    def test_main_releases_lock_after_query(self):
+        # 正常查询结束后锁被释放, 下次可再获取
+        buf = io.StringIO()
+        with mock.patch.object(fund, "_run_query"), \
+             mock.patch("sys.argv", ["fund.py", ""]), \
+             contextlib.redirect_stdout(buf):
+            fund.main()
+        self.assertFalse(os.path.exists(fund._lock_file_path()))
 
 
 class ParseHoldingsTest(unittest.TestCase):
@@ -190,6 +288,76 @@ class BuildEstimatesLinkedEtfTest(unittest.TestCase):
              mock.patch.object(fund, "fetch_stock_quotes", return_value={"600519": 2.0}):
             est = fund.build_estimates(["008163"], self.RESULT)["008163"]
         self.assertIsNone(est)
+
+
+class GroupSelectionTest(unittest.TestCase):
+    """分组选择: 仅一个分组时默认查询第 1 组; 多个分组必须输入序号才查询。"""
+
+    MULTI_CFG = {
+        "groups": [
+            {"name": "核心", "funds": [{"code": "161725", "num": 100}]},
+            {"name": "卫星", "funds": [{"code": "005827", "num": 200}]},
+        ]
+    }
+    SINGLE_CFG = {
+        "groups": [{"name": "默认", "funds": [{"code": "161725", "num": 100}]}]
+    }
+
+    @staticmethod
+    def _fake_fetch(codes):
+        rows = {
+            c: {"fundcode": c, "name": f"基金{c}", "dwjz": "1.0000", "jzrq": "2026-08-18",
+                "gsz": None, "gszzl": None, "gztime": None, "navchgrt": "0.00"}
+            for c in codes
+        }
+        return rows, ""
+
+    def _run(self, cfg, query):
+        buf = io.StringIO()
+        with mock.patch.object(fund, "load_config", return_value=cfg), \
+             mock.patch.object(fund, "build_estimates", return_value={}), \
+             mock.patch.object(fund, "fetch_funds", side_effect=self._fake_fetch) as m, \
+             contextlib.redirect_stdout(buf):
+            fund._run_query(query)
+        return json.loads(buf.getvalue()), m
+
+    def test_single_group_queries_by_default(self):
+        # 仅 1 个分组: 空 query 直接查询该组, 无需输入序号
+        out, m = self._run(self.SINGLE_CFG, "")
+        m.assert_called_once()
+        self.assertEqual(m.call_args[0][0], ["161725"])
+        self.assertIn("默认", out["items"][0]["title"])  # 合计行标注分组名
+
+    def test_multi_group_without_index_shows_choices_only(self):
+        # 多分组: 未输入序号 -> 只列出分组供选择, 不发起网络请求
+        out, m = self._run(self.MULTI_CFG, "")
+        m.assert_not_called()
+        self.assertEqual(len(out["items"]), 2)
+        self.assertIn("核心", out["items"][0]["title"])
+        self.assertIn("卫星", out["items"][1]["title"])
+        self.assertEqual(out["items"][0]["autocomplete"], "1")
+        self.assertEqual(out["items"][1]["autocomplete"], "2")
+
+    def test_multi_group_with_index_queries_that_group(self):
+        # 多分组: 输入序号 2 -> 查询第 2 组
+        out, m = self._run(self.MULTI_CFG, "2")
+        m.assert_called_once()
+        self.assertEqual(m.call_args[0][0], ["005827"])
+        self.assertIn("卫星", out["items"][0]["title"])
+
+    def test_multi_group_out_of_range_shows_choices(self):
+        # 多分组: 序号越界 -> 错误提示 + 分组选择列表, 不查询
+        out, m = self._run(self.MULTI_CFG, "9")
+        m.assert_not_called()
+        self.assertEqual(len(out["items"]), 3)  # 越界错误行 + 2 个分组
+        self.assertIn("越界", out["items"][0]["title"])
+
+    def test_single_group_out_of_range_falls_back(self):
+        # 仅 1 个分组: 序号越界 -> 提示后回落到该组继续查询
+        out, m = self._run(self.SINGLE_CFG, "5")
+        m.assert_called_once()
+        self.assertIn("越界", out["items"][0]["title"])
+        self.assertIn("默认", out["items"][1]["title"])
 
 
 if __name__ == "__main__":
