@@ -32,11 +32,6 @@ API_URL = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo"
 DEVICE_ID = "00000000-0000-4000-8000-000000000000"  # 原项目用随机 UUID, 固定值即可
 TIMEOUT = 6  # seconds per request
 
-# 网络重试: 应对限流/临时故障。指数退避, 每次间隔加长 (见 _backoff_delay)。
-RETRIES = 4                # 每层查询的最多重试次数(不含首次, 总共 RETRIES+1 次)
-RETRY_DELAY_BASE = 1.0     # 退避基础延迟(秒): 第 n 次重试 ≈ BASE * 2^(n-1)
-RETRY_DELAY_JITTER = 0.5   # 随机抖动上限(秒), 错开同时失败的重试请求, 避免雪崩
-
 # 持仓自算估值常量
 SCALE_TO_FULL = True       # True=口径B(放大到满仓); False=口径A(其余按0)
 MIN_COVERAGE = 20.0        # 前十大占净值比低于此(%)视为不可信, 降级
@@ -128,17 +123,8 @@ def normalize_groups(cfg: dict) -> list:
 
 
 # ---------- HTTP ----------
-def _backoff_delay(attempt: int) -> float:
-    """第 attempt 次重试前的等待秒数: 指数退避 + 随机抖动。
-
-    attempt 从 1 开始; 间隔序列 ≈ BASE, 2*BASE, 4*BASE, ... 每次间隔加长
-    (例如 1~1.5s, 2~2.5s, 4~4.5s, 8~8.5s), 抖动用于错开并发失败的重试。
-    """
-    return RETRY_DELAY_BASE * (2 ** (attempt - 1)) + random.uniform(0, RETRY_DELAY_JITTER)
-
-
 def _curl_get_text(url: str, headers: Optional[dict] = None, timeout: int = TIMEOUT,
-                   retries: int = 0) -> str:
+                   retries: int = 2) -> str:
     """用 curl 子进程发起 GET, 返回响应文本, 失败返 ''。
 
     天天基金 push2 行情服务器对 Python urllib 的 TLS 指纹反爬 (直接 RST 连接,
@@ -147,12 +133,11 @@ def _curl_get_text(url: str, headers: Optional[dict] = None, timeout: int = TIME
     更稳, 避免后续反爬升级再次"突然全 0"。
 
     retries: 额外重试次数 (总共 retries+1 次), 指数退避 + 随机抖动。
-    默认 0 = 单次请求: 重试策略统一由调用方 (fetch_*) 外层控制, 避免嵌套重试
-    把总等待指数放大。仅对"响应为空/curl 异常"重试。
     """
     for attempt in range(retries + 1):
         if attempt > 0:
-            time.sleep(_backoff_delay(attempt))
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            time.sleep(delay)
         cmd = ["curl", "-sS", "-m", str(timeout), "--compressed", url]
         for k, v in (headers or {}).items():
             cmd += ["-H", f"{k}: {v}"]
@@ -180,15 +165,14 @@ def _normalize_row(row: dict) -> dict:
     }
 
 
-def fetch_funds(codes, retries=RETRIES):
+def fetch_funds(codes, retries=2):
     """批量拉取基金估值。返回 (results, expansion_gztime)。
 
     results: {code: normalized_row_or_None}
     expansion_gztime: API 响应级 GZTIME（单只基金 GZTIME 为 null 时的 fallback）
 
     使用天天基金 FundMNFInfo 批量端点; 不存在的 code 不会出现在 Datas 中 -> None (missing)。
-    遇到空响应或大量缺失时自动重试 (最多 retries 次重试, 指数退避 + 抖动, 间隔逐次加长)。
-    内层 _curl_get_text 只发单次请求, 重试完全由此处控制。
+    遇到空响应或大量缺失时自动重试 (retries 次额外尝试)。
     """
     out = {c: None for c in codes}
     expansion_gztime = None
@@ -211,7 +195,8 @@ def fetch_funds(codes, retries=RETRIES):
     }
     for attempt in range(retries + 1):
         if attempt > 0:
-            time.sleep(_backoff_delay(attempt))
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            time.sleep(delay)
         payload = json.loads(_curl_get_text(f"{API_URL}?{qs}", req_headers) or "{}")
         expansion = payload.get("Expansion") or {}
         expansion_gztime = expansion.get("GZTIME")
@@ -293,12 +278,12 @@ def _cache_fresh(entry: dict) -> bool:
     return age_days < HOLDINGS_CACHE_DAYS
 
 
-def _fetch_holdings_remote(code: str, retries: int = 2):
+def _fetch_holdings_remote(code: str, retries: int = 1):
     """逐季报倒推拉取, 返回 [{secid, name, weight}] 或 []。
-    全部季报失败时重试数轮 (指数退避, 间隔逐次加长), 应对服务器临时错误页。"""
+    全部季报失败时重试一轮 (retries 次额外尝试), 应对服务器临时错误页。"""
     for attempt in range(retries + 1):
         if attempt > 0:
-            time.sleep(_backoff_delay(attempt))
+            time.sleep(1.0 + random.uniform(0, 0.5))
         for year, month in _recent_quarter_ends(4):
             qs = urllib.parse.urlencode({
                 "type": "jjcc",
@@ -339,12 +324,10 @@ def fetch_holdings(code: str):
     return []
 
 
-def fetch_stock_quotes(secids, retries=RETRIES):
+def fetch_stock_quotes(secids, retries=2):
     """批量拉取股票当日涨跌幅。返回 {裸代码: 涨跌幅%}。失败返 {}。
 
-    遇到空行情时自动重试 (最多 retries 次重试, 指数退避 + 抖动, 间隔逐次加长),
-    因为空行情会导致所有基金自算估值降级。
-    内层 _curl_get_text 只发单次请求, 重试完全由此处控制。
+    遇到空行情时自动重试 (retries 次额外尝试), 因为空行情会导致所有基金自算估值降级。
     """
     if not secids:
         return {}
@@ -356,7 +339,8 @@ def fetch_stock_quotes(secids, retries=RETRIES):
     })
     for attempt in range(retries + 1):
         if attempt > 0:
-            time.sleep(_backoff_delay(attempt))
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            time.sleep(delay)
         try:
             payload = json.loads(_curl_get_text(f"{STOCK_QUOTE_API}?{qs}", {"User-Agent": "Mozilla/5.0"}) or "{}")
         except (ValueError, TypeError):
@@ -500,8 +484,7 @@ def estimate_gsz_by_index(nav, index_code, quotes):
 
 def fetch_fund_detail(code: str):
     """取基金跟踪指数代码 (FundMNDetailInformation.INDEXCODE), 带缓存。
-    非指数基金/失败返 None。缓存并入 holdings_cache (跟踪标的基本不变)。
-    失败时重试 (指数退避, 间隔逐次加长) 后再回退旧缓存。"""
+    非指数基金/失败返 None。缓存并入 holdings_cache (跟踪标的基本不变)。"""
     cache = load_holdings_cache()
     entry = cache.get(code) or {}
     idx = entry.get("indexcode")
@@ -516,23 +499,21 @@ def fetch_fund_detail(code: str):
         "product": "EFund",
         "Version": "1",
     })
-    url = f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNDetailInformation?{qs}"
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"}
-    for attempt in range(RETRIES + 1):
-        if attempt > 0:
-            time.sleep(_backoff_delay(attempt))
-        try:
-            payload = json.loads(_curl_get_text(url, headers) or "{}")
-            datas = payload.get("Datas") or {}
-            raw_idx = (datas.get("INDEXCODE") or "").strip()
-            # 过滤无效占位符 (空 / "--" 等), 保留数字与港股字母代码(如 HSTECH)
-            idx = raw_idx if (raw_idx and raw_idx != "--") else None
-        except Exception:
-            idx = None
-        if idx is not None:
-            cache[code] = {**entry, "indexcode": idx, "fetched_at": datetime.now().timestamp()}
-            save_holdings_cache(cache)
-            return idx
+    try:
+        payload = json.loads(_curl_get_text(
+            f"https://fundmobapi.eastmoney.com/FundMNewApi/FundMNDetailInformation?{qs}",
+            {"User-Agent": "Mozilla/5.0 (Macintosh; Alfred funds-alfred)"},
+        ) or "{}")
+        datas = payload.get("Datas") or {}
+        raw_idx = (datas.get("INDEXCODE") or "").strip()
+        # 过滤无效占位符 (空 / "--" 等), 保留数字与港股字母代码(如 HSTECH)
+        idx = raw_idx if (raw_idx and raw_idx != "--") else None
+    except Exception:
+        idx = None
+    if idx is not None:
+        cache[code] = {**entry, "indexcode": idx, "fetched_at": datetime.now().timestamp()}
+        save_holdings_cache(cache)
+        return idx
     # 远程失败回退: 仅当旧缓存为有效值时才使用
     old_idx = entry.get("indexcode")
     if old_idx and old_idx != "--":
@@ -892,89 +873,6 @@ def item_error(title: str, subtitle: str) -> dict:
     }
 
 
-def item_group_choice(index: int, group: dict) -> dict:
-    """多分组选择列表中的一行: 列出分组, 回车/Tab 自动补全该组序号。"""
-    count = len(group["funds"])
-    return {
-        "title": f"{index + 1}.  {group['name']}",
-        "subtitle": f"{count} 只基金  ·  输入 {index + 1} 查询该分组",
-        "autocomplete": str(index + 1),
-        "arg": "",
-        "valid": False,
-    }
-
-
-def item_busy(subtitle: str = "已有查询正在执行, 本次请求已忽略") -> dict:
-    """查询进行中、本次请求被忽略时的占位提示。"""
-    return {
-        "title": "⏳ 查询进行中",
-        "subtitle": subtitle,
-        "arg": "",
-        "valid": False,
-    }
-
-
-# ---------- 跨进程互斥 ----------
-# Alfred 每次触发都会新起一个进程; 查询类请求用数据目录下的 PID 锁文件互斥:
-# 已有查询进行中时, 新请求直接忽略, 防止重复请求加重限流。
-LOCK_FILE = "query.lock"
-LOCK_TIMEOUT = 180  # 秒; 超过视为 stale 锁可接管 (防崩溃残留 / PID 复用永久卡死)
-
-
-def _lock_file_path() -> str:
-    return os.path.join(get_data_dir(), LOCK_FILE)
-
-
-def _lock_busy(path: str) -> bool:
-    """锁文件持有者是否仍在执行中: 进程存活且未超时。"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            pid, at = f.read().split()
-        pid, at = int(pid), float(at)
-    except (OSError, ValueError, TypeError):
-        return False  # 空 / 损坏 -> 视作 stale
-    if time.time() - at > LOCK_TIMEOUT:
-        return False
-    try:
-        os.kill(pid, 0)  # 信号 0 仅探测进程是否存在, 不实际发信号
-    except OSError:
-        return False
-    return True
-
-
-def _acquire_query_lock() -> Optional[str]:
-    """尝试获取查询互斥锁。成功返回锁文件路径; 已有查询进行中返 None。
-
-    O_EXCL 原子创建, 并发进程只有一个能拿到; 崩溃残留的锁
-    (持有者进程已死或超过 LOCK_TIMEOUT) 会被清理接管。
-    """
-    path = _lock_file_path()
-    for attempt in range(2):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            if _lock_busy(path) or attempt == 1:
-                return None
-            try:
-                os.remove(path)  # stale 锁 -> 清理后重试一轮
-            except OSError:
-                return None
-            continue
-        else:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"{os.getpid()} {time.time()}\n")
-            return path
-    return None
-
-
-def _release_query_lock(path: Optional[str]) -> None:
-    if path:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
 # ---------- 主流程 ----------
 def main():
     query = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
@@ -1002,21 +900,6 @@ def main():
         print(json.dumps(out, ensure_ascii=False))
         return
 
-    # 查询类请求 (含 `sum`): 跨进程互斥, 已有查询进行中则忽略本次请求,
-    # 防止用户连续触发/并发自动化导致重复拉取、加重限流。
-    lock_path = _acquire_query_lock()
-    if not lock_path:
-        out = {"items": [item_busy()]}
-        print(json.dumps(out, ensure_ascii=False))
-        return
-    try:
-        _run_query(query)
-    finally:
-        _release_query_lock(lock_path)
-
-
-def _run_query(query: str) -> None:
-    """正常查询 / `fund sum` 汇总共用流程: 读配置 -> 并发拉取 -> 输出。"""
     # 1. 读配置
     try:
         cfg = load_config()
@@ -1046,41 +929,19 @@ def _run_query(query: str) -> None:
         cmd_sum(groups)
         return
 
-    # 分组选择规则:
-    #   - 仅一个分组 -> 默认查询第 1 组 (无需输入序号)
-    #   - 多个分组 -> 必须输入分组序号才查询; 否则列出分组供选择, 不发起网络请求
-    selected_idx = None  # 已确定的分组索引; None 表示尚未选定
+    # 解析查询里的分组序号: query 第一个 token 若是数字 -> 切到对应组 (1-based)
+    selected_idx = 0  # 默认第 1 组
+    out_of_range_msg = ""
     if query:
         first = query.split()[0]
         if first.isdigit():
             n = int(first)
             if 1 <= n <= len(groups):
                 selected_idx = n - 1
-
-    if selected_idx is None:
-        if len(groups) > 1:
-            # 多分组且未给出有效序号 -> 列出分组供选择, 不查询
-            items = []
-            if query and query.split()[0].isdigit():
-                n = int(query.split()[0])
-                items.append(
-                    item_error(
-                        "分组序号越界",
-                        f"分组序号 {n} 越界 (共 {len(groups)} 组), 请输入 1-{len(groups)}",
-                    )
+            else:
+                out_of_range_msg = (
+                    f"分组序号 {n} 越界 (共 {len(groups)} 组), 已显示第 1 组"
                 )
-            items.extend(item_group_choice(i, g) for i, g in enumerate(groups))
-            print(json.dumps({"items": items}, ensure_ascii=False))
-            return
-        # 仅一个分组 -> 默认查询第 1 组 (即使输入了越界序号也回落到该组)
-        selected_idx = 0
-        out_of_range_msg = ""
-        if query and query.split()[0].isdigit():
-            out_of_range_msg = (
-                f"分组序号 {int(query.split()[0])} 越界 (仅 1 个分组), 已显示该组"
-            )
-    else:
-        out_of_range_msg = ""
 
     cur_group = groups[selected_idx]
     holdings = cur_group["funds"]
